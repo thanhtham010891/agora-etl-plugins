@@ -1,0 +1,99 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agora-etl-plugins"
+version = "0.1.0"
+description = "Official plugins for agora-etl — Redis, cron scheduling, and distributed coordination."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+keywords = ["etl", "pipeline", "async", "redis", "cron", "distributed", "data-engineering"]
+authors = [
+    { name = "Tham Tra" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries",
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = [
+    "agora-etl>=0.1.0,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/thanhtham010891/agora-etl-plugins"
+Repository = "https://github.com/thanhtham010891/agora-etl-plugins"
+BugTracker = "https://github.com/thanhtham010891/agora-etl-plugins/issues"
+
+[project.optional-dependencies]
+redis = [
+    "redis>=7.0,<8",
+]
+cron = [
+    "croniter>=6.0,<7",
+]
+distributed = [
+    "redis>=7.0,<8",
+]
+all = [
+    "agora-etl-plugins[redis,cron,distributed]",
+]
+dev = [
+    "agora-etl[dev]",
+]
+
+# ======================================================================
+# Plugin entry-point groups — auto-discovered by agora-etl at runtime
+# ======================================================================
+
+[project.entry-points."agora.sources"]
+redis_stream = "agora_plugins.redis.sources.redis:RedisStreamSource"
+redis_dlq_source = "agora_plugins.redis.dlq:RedisDLQSource"
+
+[project.entry-points."agora.sinks"]
+redis = "agora_plugins.redis.sinks.redis:RedisSink"
+redis_dlq = "agora_plugins.redis.dlq:RedisDLQSink"
+
+[project.entry-points."agora.ai.caches"]
+redis = "agora_plugins.redis.ai.cache:RedisLLMCache"
+
+[project.entry-points."agora.middlewares.dedup.stores"]
+redis = "agora_plugins.redis.dedup.stores.redis:RedisStore"
+redis_embedding = "agora_plugins.redis.dedup.stores.embedding:RedisEmbeddingStore"
+
+[project.entry-points."agora.state.backends"]
+redis = "agora_plugins.redis.state.redis:RedisBackend"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agora_plugins"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [".git", ".venv", "__pycache__", "dist", "build"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP", "N", "SIM", "TCH", "TRY", "G", "PIE", "RET", "RUF"]
+ignore = ["E501", "TRY003", "TRY300", "TRY301", "RET504"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: requires external services such as Kafka, Postgres, or Redis",
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true

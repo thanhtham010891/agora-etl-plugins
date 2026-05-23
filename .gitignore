@@ -1,0 +1,41 @@
+# macOS system files
+.DS_Store
+
+# Ignore virtual environment
+.venv/
+
+# Ignore .env file
+.env
+
+# Python cache
+__pycache__/
+
+# Ignore build and dist
+build/
+dist/
+htmlcov/
+
+# Python cache
+*.pyc
+*. egg-info
+.mypy_cache
+.coverage
+.pytest_cache
+.ruff_cache
+.ruff
+*.geojson
+*.parquet
+!examples/**/data/*.parquet
+
+# Ignore logs
+*.log
+*.jsonl
+!examples/**/data/*.jsonl
+*.txt
+
+# DB
+*.sqlite3
+*.db
+
+# Cache
+.cache/
