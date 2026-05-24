@@ -1,6 +1,6 @@
 # Agora ETL Plugins
 
-**Official plugin collection for [agora-etl](https://pypi.org/project/agora-etl/) — Redis, cron scheduling, and distributed coordination.**
+**Official plugin collection for [agora-etl](https://pypi.org/project/agora-etl/) — Redis, cron scheduling, distributed coordination, Kafka, and PostgreSQL.**
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
@@ -33,7 +33,9 @@ print(f"written={summary.records_written}  errors={summary.records_errored}")
 pip install "agora-etl-plugins[redis]"        # Redis source, sink, state, DLQ, dedup, AI cache
 pip install "agora-etl-plugins[cron]"         # Cron schedule support for ScheduledPipeline
 pip install "agora-etl-plugins[distributed]"  # Redis-backed distributed worker coordination
-pip install "agora-etl-plugins[all]"          # Everything
+pip install "agora-etl-plugins[kafka]"        # Kafka source and sink
+pip install "agora-etl-plugins[postgres]"     # PostgreSQL source, sink, DLQ, schema adapter
+pip install "agora-etl-plugins[all]"          # Everything in one install
 ```
 
 ---
@@ -134,13 +136,13 @@ async for record in dlq_source.stream():
 Adds cron expression support to `ScheduledPipeline`. Without this plugin, only interval-based scheduling is available.
 
 ```python
-from agora.runner import ScheduledPipeline
+from agora.runner import Schedule, ScheduledPipeline
 
 pipeline = ScheduledPipeline(
     factory=lambda: my_pipeline,
-    schedule="0 9 * * 1-5",  # weekdays at 9am
+    schedule=Schedule.cron("0 9 * * 1-5"),  # weekdays at 9am
 )
-await pipeline.run()
+await pipeline.start()
 ```
 
 Supported expression format: standard 5-field cron (`minute hour day month weekday`).
@@ -164,7 +166,8 @@ coordinator = RedisWorkerCoordinator(
     heartbeat_interval=config.heartbeat_interval,
 )
 
-pool = WorkerPool(pipelines=[my_pipeline], coordinator=coordinator)
+pool = WorkerPool(coordinator=coordinator)
+pool.register(my_pipeline)
 await pool.run()
 ```
 
@@ -180,22 +183,68 @@ await pool.run()
 
 ---
 
+### Kafka `[kafka]`
+
+Kafka source and sink built on `aiokafka`, with async serializers and bounded pending acknowledgements for backpressure-aware writes.
+
+```python
+import json
+
+from agora_plugins.kafka import KafkaSink, KafkaSource
+
+sink = KafkaSink(
+    topic="events",
+    bootstrap_servers="localhost:9092",
+    serializer=lambda record: json.dumps(record).encode(),
+)
+
+source = KafkaSource(
+    topics=["events"],
+    bootstrap_servers="localhost:9092",
+    group_id="agora-consumer",
+    deserializer=lambda payload: json.loads(payload.decode()),
+)
+```
+
+### PostgreSQL `[postgres]`
+
+PostgreSQL source, sink, DLQ, and schema adapter built on `psycopg`.
+
+```python
+from agora_plugins.postgres import PostgresSink, PostgresSource
+
+source = PostgresSource(
+    dsn="postgresql://localhost/agora",
+    query="SELECT id, name, score FROM public.events ORDER BY id",
+    row_mapper=lambda row: row,
+)
+
+sink = PostgresSink(
+    dsn="postgresql://localhost/agora",
+    table="public.events",
+    row_mapper=lambda record: record,
+    conflict_key="id",
+)
+```
+
+---
+
 ## Plugin auto-discovery
 
-All plugins register themselves via Python entry-points. After installing, run:
+Source and sink plugins register themselves via Python entry-points. After installing, run:
 
 ```bash
 agora plugins list
 ```
 
-to see all registered plugins and their capabilities.
+to see the currently registered source, sink, and middleware plugins.
 
 ---
 
 ## Requirements
 
 - Python 3.11+
-- `agora-etl >= 0.1.0`
+- `agora-etl >= 0.1.2`
 
 ---
 
