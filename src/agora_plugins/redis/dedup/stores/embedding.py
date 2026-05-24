@@ -18,6 +18,9 @@ logger = logstruct.getLogger(__name__)
 _FLOAT_FORMAT = "f"  # 32-bit float — consistent precision for all stored embeddings
 
 
+_DEFAULT_MAX_ENTRIES = 10_000
+
+
 class RedisEmbeddingStore(DedupStore[str]):
     """Semantic dedup store backed by Redis.
 
@@ -32,11 +35,13 @@ class RedisEmbeddingStore(DedupStore[str]):
         similarity_threshold: float = 0.92,
         redis_url: str = "redis://localhost:6379",
         redis_key_prefix: str = "agora:dedup:emb:",
+        max_entries: int = _DEFAULT_MAX_ENTRIES,
     ) -> None:
         self._provider = provider
         self._threshold = similarity_threshold
         self._redis_url = redis_url
         self._redis_prefix = redis_key_prefix
+        self._max_entries = max_entries
         self._redis: AsyncRedis | None = None
 
     async def open(self) -> None:
@@ -47,6 +52,14 @@ class RedisEmbeddingStore(DedupStore[str]):
         return await self._redis_exists(query_embedding=embedding)
 
     async def add(self, key: str) -> None:
+        redis = await self._ensure_redis()
+        index_key = f"{self._redis_prefix}__index__"
+        current_size = await redis.scard(index_key)
+        if current_size >= self._max_entries:
+            raise RuntimeError(
+                f"RedisEmbeddingStore has reached max_entries={self._max_entries}. "
+                "Use a dedicated vector database for larger datasets."
+            )
         embedding = (await self._provider.embed(key)).embedding
         await self._redis_add(key, embedding)
 

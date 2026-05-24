@@ -142,7 +142,7 @@ class RedisWorkerCoordinator(WorkerCoordinator):
                 self._redis = None
                 return
             raise RuntimeError(
-                f"agora-distributed: cannot connect to Redis at "
+                f"agora-etl-plugins distributed coordinator cannot connect to Redis at "
                 f"{_redact_url(self._redis_url)!r}: {exc}"
             ) from exc
 

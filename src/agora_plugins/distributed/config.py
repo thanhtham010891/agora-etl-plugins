@@ -1,4 +1,4 @@
-"""DistributedConfig — pydantic-settings for agora-distributed."""
+"""DistributedConfig — pydantic-settings for Agora worker coordination."""
 
 from __future__ import annotations
 

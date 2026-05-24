@@ -1,4 +1,4 @@
-"""Plugin metadata for the official Redis integration."""
+"""Plugin metadata for the official Kafka integration."""
 
 from __future__ import annotations
 
@@ -28,18 +28,12 @@ def _package_version() -> str:
 
 
 MANIFEST = PluginManifest(
-    name="redis",
+    name="kafka",
     version=_package_version(),
     agora_api_version=AGORA_API_VERSION,
     package="agora-etl-plugins",
     capabilities=(
-        "source:redis_dlq_source",
-        "source:redis_stream",
-        "sink:redis_dlq",
-        "sink:redis",
-        "state:redis",
-        "dedup_store:redis",
-        "dedup_store:embedding_redis",
-        "ai_cache:redis",
+        "source:kafka",
+        "sink:kafka",
     ),
 )
