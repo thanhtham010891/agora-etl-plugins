@@ -241,6 +241,87 @@ async def test_kafka_sink_open_filters_unsupported_producer_kwargs(
 
 
 @pytest.mark.asyncio
+async def test_kafka_sink_open_closes_serializer_if_producer_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(kafka_module, "_AIOKAFKA_AVAILABLE", True)
+    lifecycle: list[str] = []
+
+    class _Serializer:
+        def open(self) -> None:
+            lifecycle.append("open")
+
+        def close(self) -> None:
+            lifecycle.append("close")
+
+        def __call__(self, record: str) -> bytes:
+            return record.encode()
+
+    class FakeProducer:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        async def start(self) -> None:
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(kafka_module, "AIOKafkaProducer", FakeProducer)
+
+    sink = KafkaSink(
+        topic="events",
+        bootstrap_servers="localhost:9092",
+        serializer=_Serializer(),
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await sink.open()
+
+    assert lifecycle == ["open", "close"]
+    assert sink._producer is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_kafka_sink_open_stops_producer_if_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(kafka_module, "_AIOKAFKA_AVAILABLE", True)
+    stop_calls = 0
+
+    class _Serializer:
+        def open(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def __call__(self, record: str) -> bytes:
+            return record.encode()
+
+    class FakeProducer:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        async def start(self) -> None:
+            raise RuntimeError("boom")
+
+        async def stop(self) -> None:
+            nonlocal stop_calls
+            stop_calls += 1
+
+    monkeypatch.setattr(kafka_module, "AIOKafkaProducer", FakeProducer)
+
+    sink = KafkaSink(
+        topic="events",
+        bootstrap_servers="localhost:9092",
+        serializer=_Serializer(),
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await sink.open()
+
+    assert stop_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_kafka_sink_write_uses_bounded_send_queue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

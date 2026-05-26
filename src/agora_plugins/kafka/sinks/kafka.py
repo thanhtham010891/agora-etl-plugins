@@ -86,19 +86,30 @@ class KafkaSink(BaseSink[T], Generic[T]):
         await self.close()
 
     async def open(self) -> None:
-        await self._open_serializer()
-        producer_kwargs = self._supported_producer_kwargs()
-        self._producer = AIOKafkaProducer(
-            bootstrap_servers=self._bootstrap,
-            security_protocol=self._security_protocol,
-            **producer_kwargs,
-        )
-        await self._producer.start()
-        logger.info(
-            "kafka_sink_ready",
-            topic=self._topic,
-            brokers=self._bootstrap,
-        )
+        try:
+            await self._open_serializer()
+            producer_kwargs = self._supported_producer_kwargs()
+            self._producer = AIOKafkaProducer(
+                bootstrap_servers=self._bootstrap,
+                security_protocol=self._security_protocol,
+                **producer_kwargs,
+            )
+            await self._producer.start()
+            logger.info(
+                "kafka_sink_ready",
+                topic=self._topic,
+                brokers=self._bootstrap,
+            )
+        except Exception:
+            producer = self._producer
+            self._producer = None
+            if producer is not None:
+                try:
+                    await producer.stop()
+                except Exception:
+                    logger.exception("kafka_sink_open_cleanup_error", topic=self._topic)
+            await self._close_serializer()
+            raise
 
     async def close(self) -> None:
         if self._producer is not None:

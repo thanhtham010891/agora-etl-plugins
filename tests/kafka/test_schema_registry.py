@@ -179,3 +179,41 @@ async def test_confluent_schema_registry_client_sends_expected_requests(
     assert requests_seen[1][0] == "POST"
     assert requests_seen[1][1].endswith("/subjects/orders-value/versions")
     assert b'"schemaType": "AVRO"' in requests_seen[1][3]
+
+
+@pytest.mark.asyncio
+async def test_schema_registry_client_url_encodes_subject_segments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests_seen: list[str] = []
+
+    class _Response:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self._payload = payload
+
+        def read(self) -> bytes:
+            return json.dumps(self._payload).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    def _fake_urlopen(req, timeout: float):
+        del timeout
+        requests_seen.append(req.full_url)
+        return _Response(
+            {
+                "id": 7,
+                "subject": "orders/dev-value",
+                "schema": '{"type":"record","name":"Event","fields":[]}',
+            }
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    client = ConfluentSchemaRegistryClient("http://registry:8081")
+    await client.get_latest_schema("orders/dev-value")
+
+    assert requests_seen == ["http://registry:8081/subjects/orders%2Fdev-value/versions/latest"]

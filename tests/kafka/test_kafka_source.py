@@ -248,6 +248,78 @@ async def test_prepare_resume_seeks_consumer_to_next_offset() -> None:
 
 
 @pytest.mark.asyncio
+async def test_kafka_source_open_closes_deserializer_if_consumer_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle: list[str] = []
+
+    class _Deserializer:
+        def open(self) -> None:
+            lifecycle.append("open")
+
+        def close(self) -> None:
+            lifecycle.append("close")
+
+        def __call__(self, value: bytes) -> str:
+            return value.decode()
+
+    class FakeConsumer:
+        def __init__(self, *topics: str, **kwargs: Any) -> None:
+            del topics, kwargs
+
+        async def start(self) -> None:
+            raise RuntimeError("boom")
+
+    fake_aiokafka = SimpleNamespace(
+        AIOKafkaConsumer=FakeConsumer,
+        TopicPartition=_FakeTopicPartition,
+    )
+    monkeypatch.setitem(sys.modules, "aiokafka", fake_aiokafka)
+
+    source = KafkaSource(
+        topics=["events"],
+        deserializer=_Deserializer(),
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await source.open()
+
+    assert lifecycle == ["open", "close"]
+    assert source._consumer is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_kafka_source_close_stops_consumer_even_if_commit_fails() -> None:
+    source = KafkaSource(
+        topics=["events"],
+        deserializer=lambda b: b.decode(),
+        enable_auto_commit=False,
+        commit_every=10,
+    )
+
+    class FakeConsumer:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        async def commit(self, offsets: dict[object, int] | None = None) -> None:
+            del offsets
+            raise RuntimeError("commit failed")
+
+        async def stop(self) -> None:
+            self.stop_calls += 1
+
+    consumer = FakeConsumer()
+    source._consumer = consumer  # type: ignore[attr-defined]
+    source._pending_commit_count = 1  # type: ignore[attr-defined]
+    source._processed_offsets = {("events", 0): 7}  # type: ignore[attr-defined]
+
+    await source.close()
+
+    assert consumer.stop_calls == 1
+    assert source._consumer is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_current_checkpoint_tracks_offsets_for_multiple_partitions() -> None:
     source = KafkaSource(
         topics=["events"],

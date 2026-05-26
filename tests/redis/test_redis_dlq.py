@@ -43,6 +43,7 @@ class _FakeAsyncRedis:
         self.hashes: dict[str, dict[str, str]] = {}
         self.lists: dict[str, list[str]] = {}
         self.closed = False
+        self.lrange_calls: list[tuple[str, int, int]] = []
 
     async def hset(self, key: str, *, mapping: dict[str, str]) -> None:
         self.hashes.setdefault(key, {}).update(mapping)
@@ -51,6 +52,7 @@ class _FakeAsyncRedis:
         self.lists.setdefault(key, []).append(value)
 
     async def lrange(self, key: str, start: int, end: int) -> list[str]:
+        self.lrange_calls.append((key, start, end))
         values = self.lists.get(key, [])
         if end == -1:
             return values[start:]
@@ -179,3 +181,32 @@ async def test_redis_dlq_source_reads_filtered_records(monkeypatch: pytest.Monke
     assert records[0].pipeline_id == "orders"
     assert records[0].record == {"id": 1}
     assert records[0].checkpoint == {"offset": 10}
+
+
+@pytest.mark.asyncio
+async def test_redis_dlq_source_stops_after_limit_without_scanning_full_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeAsyncRedis()
+    _install_fake_async_redis(monkeypatch, client)
+    sink = RedisDLQSink(url="redis://localhost:6379", key_prefix="agora:test:dlq")
+
+    await sink.open()
+    for minute in range(205):
+        await sink.write(
+            _make_record(
+                created_at=datetime(2026, 5, 21, 12, minute % 60, tzinfo=UTC),
+                run_id=f"run-{minute}",
+            )
+        )
+
+    source = RedisDLQSource(
+        url="redis://localhost:6379",
+        key_prefix="agora:test:dlq",
+        limit=5,
+    )
+    await source.open()
+    records = [record async for record in source.stream()]
+
+    assert len(records) == 5
+    assert client.lrange_calls == [("agora:test:dlq:__index__", 0, 99)]

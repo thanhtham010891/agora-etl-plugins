@@ -1,0 +1,81 @@
+name: Release package version
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate release tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import tomllib
+
+          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          expected_tag = f"v{version}"
+          release_tag = os.environ["RELEASE_TAG"]
+
+          if release_tag != expected_tag:
+              raise SystemExit(
+                  f"Release tag {release_tag!r} does not match package version {version!r}. "
+                  f"Expected tag: {expected_tag!r}."
+              )
+
+          print(f"Validated release tag {release_tag} for agora-etl-plugins {version}.")
+          PY
+
+      - name: Setup environment
+        run: make setup
+
+      - name: Run CI
+        run: make ci
+
+      - name: Build release distributions
+        run: ./.venv/bin/hatch build
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dists
+          path: dist/
+          if-no-files-found: error
+
+  pypi-publish:
+    needs:
+      - release-build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    environment:
+      name: pypi
+      url: https://pypi.org/project/agora-etl-plugins/
+    steps:
+      - name: Retrieve release distributions
+        uses: actions/download-artifact@v5
+        with:
+          name: release-dists
+          path: dist/
+
+      - name: Publish release distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

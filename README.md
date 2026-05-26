@@ -12,6 +12,13 @@
 
 `agora-etl-plugins` extends [agora-etl](https://pypi.org/project/agora-etl/) with production-ready integrations. Plugins are auto-discovered via Python entry-points — install the package and they register themselves automatically, no manual wiring needed.
 
+Canonical ecosystem docs live in the Agora docs site:
+
+- Plugin ecosystem overview: `https://agora.my-working.com/plugins/`
+- Core docs home: `https://agora.my-working.com/`
+
+This README stays focused on package-specific quickstart information.
+
 ```python
 from agora import Pipeline
 from agora_plugins.redis.sources import RedisStreamSource

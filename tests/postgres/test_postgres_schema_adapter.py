@@ -162,6 +162,32 @@ async def test_adapter_alter_table_add_columns() -> None:
 
 
 @pytest.mark.asyncio
+async def test_adapter_schema_introspection_uses_schema_qualified_lookup() -> None:
+    conn, cursor = _make_conn(table_exists=[(True,)], existing_columns=[("id",)])
+    inner = FakePostgresSink(conn)
+    adapter = PostgresSchemaAdapter(inner, auto_create=True, auto_alter=True)
+    ctx = _make_ctx()
+    ctx.extras["schema"] = Schema(
+        table="analytics.users",
+        columns={
+            "id": Column("id", DataType.INTEGER, nullable=False),
+            "name": Column("name", DataType.STRING, nullable=True),
+        },
+    )
+
+    adapter.bind_context(ctx)
+    await adapter.open()
+
+    first_query, first_params = cursor.execute.call_args_list[0][0]
+    second_query, second_params = cursor.execute.call_args_list[1][0]
+
+    assert "table_schema = %s AND table_name = %s" in first_query
+    assert first_params == ("analytics", "users")
+    assert "table_schema = %s AND table_name = %s" in second_query
+    assert second_params == ("analytics", "users")
+
+
+@pytest.mark.asyncio
 async def test_adapter_auto_create_disabled() -> None:
     conn, cursor = _make_conn(table_exists=[])
     inner = FakePostgresSink(conn)

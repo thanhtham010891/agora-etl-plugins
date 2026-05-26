@@ -81,46 +81,61 @@ class KafkaSource(BaseSource[T], Generic[T]):
         self._record_drop_count = 0
 
     async def open(self) -> None:
-        await self._open_deserializer()
         try:
+            await self._open_deserializer()
             from aiokafka import AIOKafkaConsumer
         except ImportError:
+            await self._close_deserializer()
             raise ImportError(
                 "KafkaSource requires aiokafka. Install via: pip install 'agora-etl-plugins[kafka]'"
             ) from None
+        except Exception:
+            await self._close_deserializer()
+            raise
 
-        self._topic_partition_cls = getattr(
-            importlib.import_module("aiokafka"), "TopicPartition", None
-        )
-        self._consumer = AIOKafkaConsumer(
-            *self._topics,
-            bootstrap_servers=self._bootstrap_servers,
-            group_id=self._group_id,
-            auto_offset_reset=self._auto_offset_reset,
-            enable_auto_commit=self._enable_auto_commit,
-            security_protocol=self._security_protocol,
-            max_poll_records=self._max_poll_records,
-            fetch_min_bytes=self._fetch_min_bytes,
-            fetch_max_wait_ms=self._fetch_max_wait_ms,
-            max_partition_fetch_bytes=self._max_partition_fetch_bytes,
-            **self._extra_config,
-        )
-        await self._consumer.start()
-        logger.info(
-            "kafka_source_ready",
-            topics=self._topics,
-            group_id=self._group_id,
-            bootstrap=self._bootstrap_servers,
-        )
+        try:
+            self._topic_partition_cls = getattr(
+                importlib.import_module("aiokafka"), "TopicPartition", None
+            )
+            self._consumer = AIOKafkaConsumer(
+                *self._topics,
+                bootstrap_servers=self._bootstrap_servers,
+                group_id=self._group_id,
+                auto_offset_reset=self._auto_offset_reset,
+                enable_auto_commit=self._enable_auto_commit,
+                security_protocol=self._security_protocol,
+                max_poll_records=self._max_poll_records,
+                fetch_min_bytes=self._fetch_min_bytes,
+                fetch_max_wait_ms=self._fetch_max_wait_ms,
+                max_partition_fetch_bytes=self._max_partition_fetch_bytes,
+                **self._extra_config,
+            )
+            await self._consumer.start()
+            logger.info(
+                "kafka_source_ready",
+                topics=self._topics,
+                group_id=self._group_id,
+                bootstrap=self._bootstrap_servers,
+            )
+        except Exception:
+            consumer = self._consumer
+            self._consumer = None
+            if consumer is not None:
+                with contextlib.suppress(Exception):
+                    await consumer.stop()
+            await self._close_deserializer()
+            raise
 
     async def close(self) -> None:
         if self._consumer is not None:
+            consumer = self._consumer
             try:
                 await self._commit_if_needed(force=True)
-                await self._consumer.stop()
             except Exception:
                 logger.exception("kafka_source_close_error")
             finally:
+                with contextlib.suppress(Exception):
+                    await consumer.stop()
                 self._consumer = None
                 logger.info("kafka_source_closed", group_id=self._group_id)
         await self._close_deserializer()

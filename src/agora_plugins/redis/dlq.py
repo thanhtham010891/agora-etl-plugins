@@ -190,29 +190,36 @@ class RedisDLQSource(DLQSource):
         if self._client is None:
             raise RuntimeError("RedisDLQSource.open() was not called")
 
-        keys = await self._client.lrange(self._index_key, 0, -1)
-        if not keys:
-            return
-
-        # Batch fetch all hashes in one pipeline — avoids N+1 round trips
-        async with self._client.pipeline(transaction=False) as pipe:
-            for key in keys:
-                pipe.hgetall(key)
-            payloads = await pipe.execute()
-
         yielded = 0
-        for _record_key, payload in zip(keys, payloads, strict=True):
-            if not payload:
-                continue
-            record = _hash_to_record(payload)
-            if self._pipeline_id is not None and record.pipeline_id != self._pipeline_id:
-                continue
-            if self._stage is not None and record.stage != self._stage:
-                continue
-            yield record
-            yielded += 1
-            if self._limit is not None and yielded >= self._limit:
-                break
+        chunk_size = 100
+        start = 0
+        while True:
+            end = start + chunk_size - 1
+            keys = await self._client.lrange(self._index_key, start, end)
+            if not keys:
+                return
+
+            # Batch fetch chunked hashes to avoid N+1 round trips without
+            # materializing the entire DLQ index into memory first.
+            async with self._client.pipeline(transaction=False) as pipe:
+                for key in keys:
+                    pipe.hgetall(key)
+                payloads = await pipe.execute()
+
+            for _record_key, payload in zip(keys, payloads, strict=True):
+                if not payload:
+                    continue
+                record = _hash_to_record(payload)
+                if self._pipeline_id is not None and record.pipeline_id != self._pipeline_id:
+                    continue
+                if self._stage is not None and record.stage != self._stage:
+                    continue
+                yield record
+                yielded += 1
+                if self._limit is not None and yielded >= self._limit:
+                    return
+
+            start += chunk_size
 
     @property
     def _index_key(self) -> str:

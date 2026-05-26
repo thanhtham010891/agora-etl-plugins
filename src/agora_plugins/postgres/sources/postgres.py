@@ -125,7 +125,7 @@ class PostgresSource(BaseSource[T], Generic[T]):
             from psycopg.rows import dict_row
         except ImportError:
             raise ImportError(
-                "PostgresSource requires psycopg. Install via: pip install 'agora-postgres'"
+                "PostgresSource requires psycopg. Install via: pip install 'agora-etl-plugins[postgres]'"
             ) from None
 
         logger.info("postgres_source_start", query=self._query[:80])

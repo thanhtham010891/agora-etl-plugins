@@ -19,6 +19,7 @@ _FLOAT_FORMAT = "f"  # 32-bit float — consistent precision for all stored embe
 
 
 _DEFAULT_MAX_ENTRIES = 10_000
+_SCAN_COUNT = 256
 
 
 class RedisEmbeddingStore(DedupStore[str]):
@@ -94,32 +95,33 @@ class RedisEmbeddingStore(DedupStore[str]):
     async def _redis_exists(self, query_embedding: list[float]) -> bool:
         redis = await self._ensure_redis()
         index_key = f"{self._redis_prefix}__index__"
-        all_keys = await redis.smembers(index_key)
-        if not all_keys:
-            return False
+        cursor = 0
+        while True:
+            cursor, batch_keys = await redis.sscan(index_key, cursor=cursor, count=_SCAN_COUNT)
+            if batch_keys:
+                stored_keys = [k.decode() if isinstance(k, bytes) else k for k in batch_keys]
+                field_keys = [f"{self._redis_prefix}{k}" for k in stored_keys]
 
-        # Batch fetch all embeddings in one pipeline — avoids O(N) round trips
-        stored_keys = [k.decode() if isinstance(k, bytes) else k for k in all_keys]
-        field_keys = [f"{self._redis_prefix}{k}" for k in stored_keys]
+                async with redis.pipeline(transaction=False) as pipe:
+                    for fk in field_keys:
+                        pipe.get(fk)
+                    packed_values = await pipe.execute()
 
-        async with redis.pipeline(transaction=False) as pipe:
-            for fk in field_keys:
-                pipe.get(fk)
-            packed_values = await pipe.execute()
-
-        for stored_key, packed in zip(stored_keys, packed_values, strict=True):
-            if packed is None:
-                continue
-            dimensions = len(packed) // 4
-            stored_embedding = list(struct.unpack(f"{dimensions}{_FLOAT_FORMAT}", packed))
-            similarity = _cosine_similarity(query_embedding, stored_embedding)
-            if similarity >= self._threshold:
-                logger.debug(
-                    "embedding_dedup_hit",
-                    similarity=round(similarity, 4),
-                    matched_key=stored_key,
-                )
-                return True
+                for stored_key, packed in zip(stored_keys, packed_values, strict=True):
+                    if packed is None:
+                        continue
+                    dimensions = len(packed) // 4
+                    stored_embedding = list(struct.unpack(f"{dimensions}{_FLOAT_FORMAT}", packed))
+                    similarity = _cosine_similarity(query_embedding, stored_embedding)
+                    if similarity >= self._threshold:
+                        logger.debug(
+                            "embedding_dedup_hit",
+                            similarity=round(similarity, 4),
+                            matched_key=stored_key,
+                        )
+                        return True
+            if cursor == 0:
+                break
         return False
 
 

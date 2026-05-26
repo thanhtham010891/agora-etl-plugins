@@ -81,6 +81,20 @@ def _postgres_type(data_type: DataType) -> str:
     return mapping.get(data_type, "TEXT")
 
 
+def _table_lookup_condition(table_name: str) -> tuple[str, tuple[str, ...]]:
+    parts = table_name.split(".")
+    if len(parts) == 2:
+        schema_name, relation_name = parts
+        return (
+            "table_schema = %s AND table_name = %s",
+            (schema_name, relation_name),
+        )
+    return (
+        "table_schema = ANY(current_schemas(false)) AND table_name = %s",
+        (table_name,),
+    )
+
+
 class PostgresSink(BaseSink[T], Generic[T]):
     """Generic async batch-upsert PostgreSQL sink."""
 
@@ -601,10 +615,11 @@ class PostgresSchemaAdapter(BaseSink[T], Generic[T]):
             return
 
         table_name = self._schema.table
+        where_sql, where_params = _table_lookup_condition(table_name)
         async with conn.cursor() as cur:
             await cur.execute(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = %s)",
-                (table_name.split(".")[-1],),
+                f"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE {where_sql})",
+                where_params,
             )
             result = await cur.fetchone()
             table_exists = result[0] if result else False
@@ -706,11 +721,12 @@ class PostgresSchemaAdapter(BaseSink[T], Generic[T]):
             return
 
         table_name = self._schema.table
+        where_sql, where_params = _table_lookup_condition(table_name)
         try:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
-                    (table_name.split(".")[-1],),
+                    f"SELECT column_name FROM information_schema.columns WHERE {where_sql}",
+                    where_params,
                 )
                 rows = await cur.fetchall()
                 self._existing_columns = {row[0] for row in rows}

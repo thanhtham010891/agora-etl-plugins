@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from typing import cast
 
@@ -50,11 +51,14 @@ class RedisBackend(StateBackend):
     def set(self, key: str, value: StateValue, *, expires_at: float | None = None) -> None:
         payload = json.dumps({"value": value, "expires_at": expires_at}, ensure_ascii=False)
         redis_key = self._key(key)
-        if expires_at is None:
+        ttl_ms = self._ttl_ms(expires_at)
+        if ttl_ms is None:
             self._redis.set(redis_key, payload)
             return
-        ttl_seconds = max(1, int(expires_at - time.time()))
-        self._redis.setex(redis_key, ttl_seconds, payload)
+        if ttl_ms <= 0:
+            self._redis.delete(redis_key)
+            return
+        self._redis.set(redis_key, payload, px=ttl_ms)
 
     def set_if_absent(
         self,
@@ -65,10 +69,13 @@ class RedisBackend(StateBackend):
     ) -> bool:
         payload = json.dumps({"value": value, "expires_at": expires_at}, ensure_ascii=False)
         redis_key = self._key(key)
-        if expires_at is None:
+        ttl_ms = self._ttl_ms(expires_at)
+        if ttl_ms is None:
             return bool(self._redis.set(redis_key, payload, nx=True))
-        ttl_seconds = max(1, int(expires_at - time.time()))
-        return bool(self._redis.set(redis_key, payload, nx=True, ex=ttl_seconds))
+        if ttl_ms <= 0:
+            self._redis.delete(redis_key)
+            return True
+        return bool(self._redis.set(redis_key, payload, nx=True, px=ttl_ms))
 
     def delete(self, key: str) -> None:
         self._redis.delete(self._key(key))
@@ -92,6 +99,13 @@ class RedisBackend(StateBackend):
     def _scan_prefixed_keys(self, prefix: str):
         match = self._key(f"{prefix}*")
         yield from self._redis.scan_iter(match=match)
+
+    @staticmethod
+    def _ttl_ms(expires_at: float | None) -> int | None:
+        if expires_at is None:
+            return None
+        remaining_s = expires_at - time.time()
+        return math.ceil(remaining_s * 1000)
 
 
 __all__ = ["RedisBackend"]

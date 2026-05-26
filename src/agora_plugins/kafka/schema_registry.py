@@ -9,7 +9,7 @@ import json
 import struct
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
-from urllib import error, request
+from urllib import error, parse, request
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -73,7 +73,9 @@ class ConfluentSchemaRegistryClient:
         )
 
     async def get_latest_schema(self, subject: str) -> RegisteredSchema:
-        payload = await self._request_json("GET", f"/subjects/{subject}/versions/latest")
+        payload = await self._request_json(
+            "GET", f"/subjects/{_quote_path_segment(subject)}/versions/latest"
+        )
         return RegisteredSchema(
             schema_id=payload["id"],
             schema=payload["schema"],
@@ -91,7 +93,7 @@ class ConfluentSchemaRegistryClient:
     ) -> RegisteredSchema:
         payload = await self._request_json(
             "POST",
-            f"/subjects/{subject}/versions",
+            f"/subjects/{_quote_path_segment(subject)}/versions",
             body={
                 "schema": schema,
                 "schemaType": schema_type,
@@ -262,6 +264,10 @@ def _normalize_schema_text(schema: dict[str, Any] | list[Any] | str) -> str:
     if isinstance(schema, str):
         return json.dumps(json.loads(schema), sort_keys=True, separators=(",", ":"))
     return json.dumps(schema, sort_keys=True, separators=(",", ":"))
+
+
+def _quote_path_segment(value: str) -> str:
+    return parse.quote(value, safe="")
 
 
 def _default_record_mapper(record: Any) -> dict[str, Any]:
