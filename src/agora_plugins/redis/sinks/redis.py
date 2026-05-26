@@ -63,6 +63,9 @@ class RedisSink(BaseSink[T], Generic[T]):
         self._ttl = ttl_seconds
         self._maxlen = maxlen
         self._client = None
+        self._xadd_kwargs: dict[str, Any] = {}
+        if maxlen is not None:
+            self._xadd_kwargs = {"maxlen": maxlen, "approximate": True}
 
     async def open(self) -> None:
         try:
@@ -91,14 +94,10 @@ class RedisSink(BaseSink[T], Generic[T]):
             pipe.lpush(key, value)
         elif self._mode == "rpush":
             pipe.rpush(key, value)
-        elif self._mode == "xadd":
+        else:  # xadd
             if not isinstance(value, dict):
                 raise TypeError("RedisSink mode='xadd' requires serializer to return a dict")
-            xadd_kwargs: dict[str, Any] = {}
-            if self._maxlen is not None:
-                xadd_kwargs["maxlen"] = self._maxlen
-                xadd_kwargs["approximate"] = True
-            pipe.xadd(key, value, **xadd_kwargs)
+            pipe.xadd(key, value, **self._xadd_kwargs)
 
     async def _client_command(self, key: str, value: Any) -> None:
         """Execute the configured write command directly on the async client."""
@@ -132,6 +131,11 @@ class RedisSink(BaseSink[T], Generic[T]):
         if self._client is None:
             raise RuntimeError("RedisSink.open() was not called")
         if not records:
+            return
+        if self._mode == "set" and self._ttl is None:
+            mapping = {self._key_fn(record): self._serializer(record) for record in records}
+            await self._client.mset(mapping)
+            logger.debug("redis_sink_write_batch_mset", count=len(mapping))
             return
         async with self._client.pipeline(transaction=False) as pipe:
             for record in records:

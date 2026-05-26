@@ -17,7 +17,7 @@ class _FakeRedisClient:
     ) -> None:
         self._entries = list(entries)
         self._reclaimed_batches = list(reclaimed_batches or [])
-        self.xack_calls: list[tuple[str, str, str]] = []
+        self.xack_calls: list[tuple[str, str, tuple[str, ...]]] = []
         self.xreadgroup_calls: list[dict[str, str]] = []
         self.xautoclaim_calls: list[tuple[str, str, str, int, str, int | None]] = []
         self.aclose_calls = 0
@@ -40,8 +40,8 @@ class _FakeRedisClient:
             return []
         return [entry]
 
-    async def xack(self, stream: str, group: str, msg_id: str) -> None:
-        self.xack_calls.append((stream, group, msg_id))
+    async def xack(self, stream: str, group: str, *msg_ids: str) -> None:
+        self.xack_calls.append((stream, group, msg_ids))
 
     async def xautoclaim(
         self,
@@ -66,6 +66,13 @@ async def _ack_delivery(source: RedisStreamSource[object]) -> None:
     callback = source.delivery_success_callback()
     if callback is not None:
         await callback()
+
+
+def _acked_ids(client: _FakeRedisClient) -> list[str]:
+    ids: list[str] = []
+    for _stream, _group, msg_ids in client.xack_calls:
+        ids.extend(msg_ids)
+    return ids
 
 
 class _CountSink:
@@ -117,7 +124,7 @@ async def test_redis_stream_source_fails_closed_on_bad_messages_by_default() -> 
             await _ack_delivery(source)
 
     assert records == [1]
-    assert client.xack_calls == [("events", "g", "1-0")]
+    assert _acked_ids(client) == ["1-0"]
     assert isinstance(exc_info.value.original, ValueError)
     assert exc_info.value.record == {"message_id": "2-0", "fields": {"value": "bad"}}
     assert source.runtime_metrics().to_dict() == {
@@ -157,15 +164,46 @@ async def test_redis_stream_source_can_log_and_continue_on_bad_messages() -> Non
             await _ack_delivery(source)
 
     assert records == [1, 3]
-    assert client.xack_calls == [
-        ("events", "g", "1-0"),
-        ("events", "g", "2-0"),
-        ("events", "g", "3-0"),
-    ]
+    assert _acked_ids(client) == ["1-0", "2-0", "3-0"]
     assert source.runtime_metrics().to_dict() == {
         "record_error_count": 1,
         "record_drop_count": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_redis_stream_source_batches_success_acks() -> None:
+    source = RedisStreamSource(
+        url="redis://localhost:6379",
+        stream="events",
+        group="g",
+        consumer="c",
+        deserializer=lambda fields: int(fields["value"]),
+        ack_batch_size=3,
+    )
+    client = _FakeRedisClient(
+        [
+            (
+                "events",
+                [
+                    ("1-0", {"value": "1"}),
+                    ("2-0", {"value": "2"}),
+                    ("3-0", {"value": "3"}),
+                ],
+            )
+        ]
+    )
+    source._client = client  # type: ignore[attr-defined]
+
+    records: list[int] = []
+    with pytest.raises(asyncio.CancelledError):
+        async for record in source.stream():
+            records.append(record)
+            await _ack_delivery(source)
+
+    assert records == [1, 2, 3]
+    assert _acked_ids(client) == ["1-0", "2-0", "3-0"]
+    assert client.xack_calls == [("events", "g", ("1-0", "2-0", "3-0"))]
 
 
 @pytest.mark.asyncio
@@ -220,10 +258,7 @@ async def test_redis_stream_source_resume_replays_pending_then_tails_new_message
         {"events": "3-0"},
         {"events": ">"},
     ]
-    assert client.xack_calls == [
-        ("events", "g", "3-0"),
-        ("events", "g", "4-0"),
-    ]
+    assert _acked_ids(client) == ["3-0", "4-0"]
     assert source.current_checkpoint() == {
         "stream": "events",
         "group": "g",
@@ -263,7 +298,7 @@ async def test_redis_stream_source_does_not_ack_bad_messages_when_ack_disabled()
             await _ack_delivery(source)
 
     assert records == [2]
-    assert client.xack_calls == []
+    assert _acked_ids(client) == []
     assert source.runtime_metrics().to_dict() == {
         "record_error_count": 1,
         "record_drop_count": 1,
@@ -308,11 +343,7 @@ async def test_redis_stream_source_reclaims_pending_messages_before_tailing_new_
     assert records == [2, 3, 4]
     assert client.xautoclaim_calls[0] == ("events", "g", "c", 60_000, "0-0", 2)
     assert client.xreadgroup_calls[0] == {"events": ">"}
-    assert client.xack_calls == [
-        ("events", "g", "2-0"),
-        ("events", "g", "3-0"),
-        ("events", "g", "4-0"),
-    ]
+    assert _acked_ids(client) == ["2-0", "3-0", "4-0"]
 
 
 @pytest.mark.asyncio
@@ -349,4 +380,4 @@ async def test_redis_stream_source_acknowledges_final_record_when_pipeline_stops
 
     assert summary.records_consumed == 1
     assert sink.count == 1
-    assert client.xack_calls == [("events", "g", "1-0")]
+    assert _acked_ids(client) == ["1-0"]

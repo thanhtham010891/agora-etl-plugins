@@ -79,6 +79,8 @@ class KafkaSource(BaseSource[T], Generic[T]):
         self._topic_partition_cls = None
         self._record_error_count = 0
         self._record_drop_count = 0
+        self._checkpoint_cache: dict[str, Any] | None = None
+        self._checkpoint_dirty = False
 
     async def open(self) -> None:
         try:
@@ -323,12 +325,15 @@ class KafkaSource(BaseSource[T], Generic[T]):
     def _remember_processed_offset(self, topic: str, partition: int, offset: int) -> None:
         self._processed_offsets[(str(topic), int(partition))] = int(offset)
         self._last_seen = (str(topic), int(partition), int(offset))
+        self._checkpoint_dirty = True
 
     def current_checkpoint(self) -> dict[str, Any] | None:
         if not self._processed_offsets or self._last_seen is None:
             return None
+        if not self._checkpoint_dirty and self._checkpoint_cache is not None:
+            return self._checkpoint_cache
         last_topic, last_partition, last_offset = self._last_seen
-        return {
+        self._checkpoint_cache = {
             "topic": last_topic,
             "partition": last_partition,
             "offset": last_offset,
@@ -337,6 +342,8 @@ class KafkaSource(BaseSource[T], Generic[T]):
                 for (t, p), o in sorted(self._processed_offsets.items())
             ],
         }
+        self._checkpoint_dirty = False
+        return self._checkpoint_cache
 
     def _build_topic_partition(self, topic: str, partition: int) -> object:
         if self._topic_partition_cls is not None:

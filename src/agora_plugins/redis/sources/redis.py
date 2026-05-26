@@ -30,7 +30,7 @@ from agora.core.source import BaseSource, SourceRecordError, SourceRuntimeMetric
 from agora.core.types import SourceRecordFailurePolicy
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable, Callable
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 
     from agora.core.checkpoint import Checkpoint
 
@@ -54,6 +54,8 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
         block_ms: int = 2000,
         batch_size: int = 100,
         ack_on_success: bool = True,
+        ack_batch_size: int | None = None,
+        decode_responses: bool = True,
         reclaim_idle_ms: int | None = None,
         reclaim_batch_size: int | None = None,
         on_deserialize_error: SourceRecordFailurePolicy = SourceRecordFailurePolicy.FAIL_CLOSED,
@@ -68,6 +70,8 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
         self._block_ms = block_ms
         self._batch_size = batch_size
         self._ack_on_success = ack_on_success
+        self._ack_batch_size = max(1, ack_batch_size or batch_size)
+        self._decode_responses = decode_responses
         self._reclaim_idle_ms = (
             max(1, int(reclaim_idle_ms)) if reclaim_idle_ms is not None else None
         )
@@ -81,6 +85,8 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
         self._record_error_count = 0
         self._record_drop_count = 0
         self._delivery_success_hook: Callable[[], Awaitable[None]] | None = None
+        self._pending_ack_ids: list[str | bytes] = []
+        self._checkpoint_cache: dict[str, str] | None = None
 
     async def open(self) -> None:
         try:
@@ -90,7 +96,7 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
                 "RedisStreamSource requires redis. Install via: pip install 'agora-etl-plugins[redis]'"
             ) from None
 
-        self._client = aioredis.from_url(self._url, decode_responses=True)
+        self._client = aioredis.from_url(self._url, decode_responses=self._decode_responses)
 
         try:
             await self._client.xgroup_create(self._stream, self._group, id="0", mkstream=True)
@@ -111,6 +117,7 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
 
     async def close(self) -> None:
         if self._client is not None:
+            await self._flush_pending_acks()
             await self._client.aclose()
             self._client = None
             logger.info("redis_stream_source_closed", stream=self._stream)
@@ -159,6 +166,7 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
                     block=self._block_ms,
                 )
             except asyncio.CancelledError:
+                await self._flush_pending_acks()
                 logger.info("redis_stream_source_cancelled", stream=self._stream)
                 raise
             except Exception:
@@ -186,12 +194,18 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
     def current_checkpoint(self) -> dict[str, str] | None:
         if self._last_message_id is None:
             return None
-        return {
+        if (
+            self._checkpoint_cache is not None
+            and self._checkpoint_cache["message_id"] == self._last_message_id
+        ):
+            return self._checkpoint_cache
+        self._checkpoint_cache = {
             "stream": self._stream,
             "group": self._group,
             "consumer": self._consumer,
             "message_id": self._last_message_id,
         }
+        return self._checkpoint_cache
 
     async def _read_reclaimed_messages(
         self,
@@ -238,9 +252,10 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
     ) -> AsyncGenerator[T, None]:
         for _stream_name, messages in entries:
             for msg_id, fields in messages:
-                self._last_message_id = msg_id
+                normalized_message_id = self._normalize_message_id(msg_id)
+                self._last_message_id = normalized_message_id
                 if self._resume_pending:
-                    self._resume_cursor = msg_id
+                    self._resume_cursor = normalized_message_id
                 try:
                     record = self._deserializer(fields)
                 except Exception as exc:
@@ -254,11 +269,15 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
                     if self._on_deserialize_error == SourceRecordFailurePolicy.LOG_AND_CONTINUE:
                         self._record_drop_count += 1
                         if self._ack_on_success:
-                            await self._client.xack(self._stream, self._group, msg_id)
+                            await self._enqueue_ack(msg_id)
                         continue
+                    await self._flush_pending_acks()
                     raise SourceRecordError(
                         exc,
-                        record={"message_id": msg_id, "fields": dict(fields)},
+                        record={
+                            "message_id": normalized_message_id,
+                            "fields": self._normalize_error_fields(fields),
+                        },
                         checkpoint=self.current_checkpoint(),
                         source=self.source_name,
                     ) from exc
@@ -266,16 +285,50 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
                 self._delivery_success_hook = self._build_ack_callback(msg_id)
                 yield record
 
-    def _build_ack_callback(self, msg_id: str) -> Callable[[], Awaitable[None]] | None:
+    def _build_ack_callback(self, msg_id: str | bytes) -> Callable[[], Awaitable[None]] | None:
         if not self._ack_on_success:
             return None
 
         async def _ack() -> None:
             if self._client is None:
                 raise RuntimeError("RedisStreamSource client is closed — cannot ack message")
-            await self._client.xack(self._stream, self._group, msg_id)
+            await self._enqueue_ack(msg_id)
 
         return _ack
+
+    async def _enqueue_ack(self, msg_id: str | bytes) -> None:
+        self._pending_ack_ids.append(msg_id)
+        if len(self._pending_ack_ids) >= self._ack_batch_size:
+            await self._flush_pending_acks()
+
+    async def _flush_pending_acks(self) -> None:
+        if self._client is None or not self._pending_ack_ids:
+            return
+        pending_ids, self._pending_ack_ids = self._pending_ack_ids, []
+        await self._client.xack(self._stream, self._group, *pending_ids)
+
+    @staticmethod
+    def _normalize_message_id(msg_id: str | bytes) -> str:
+        if isinstance(msg_id, bytes):
+            return msg_id.decode("utf-8")
+        return msg_id
+
+    @classmethod
+    def _normalize_error_fields(
+        cls,
+        fields: Mapping[str | bytes, Any],
+    ) -> dict[str, Any]:
+        normalized: dict[str, Any] = {}
+        for key, value in fields.items():
+            normalized_key = key.decode("utf-8") if isinstance(key, bytes) else key
+            if isinstance(value, bytes):
+                try:
+                    normalized[normalized_key] = value.decode("utf-8")
+                except UnicodeDecodeError:
+                    normalized[normalized_key] = value.hex()
+            else:
+                normalized[normalized_key] = value
+        return normalized
 
     @staticmethod
     def _parse_xautoclaim_response(

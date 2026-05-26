@@ -49,6 +49,9 @@ class _FakeClient:
     async def xadd(self, key: str, value: dict[str, object], **kwargs: object) -> None:
         self.calls.append(("xadd", (key, value), kwargs))
 
+    async def mset(self, mapping: dict[str, object]) -> None:
+        self.calls.append(("mset", (mapping,), {}))
+
     def pipeline(self, *, transaction: bool):
         assert transaction is False
         return self.pipeline_obj
@@ -77,6 +80,27 @@ async def test_redis_sink_write_uses_set_with_ttl() -> None:
     await sink.write({"id": "alpha", "value": "hello"})
 
     assert client.calls == [("set", ("alpha", "hello"), {"ex": 30})]
+
+
+@pytest.mark.asyncio
+async def test_redis_sink_write_batch_uses_mset_for_set_without_ttl() -> None:
+    sink = RedisSink(
+        url="redis://localhost:6379",
+        key_fn=lambda record: record["id"],
+        serializer=lambda record: record["value"],
+    )
+    client = _FakeClient()
+    sink._client = client  # type: ignore[attr-defined]
+
+    await sink.write_batch(
+        [
+            {"id": "a", "value": "alpha"},
+            {"id": "b", "value": "beta"},
+        ]
+    )
+
+    assert client.calls == [("mset", ({"a": "alpha", "b": "beta"},), {})]
+    assert client.pipeline_obj.executed is False
 
 
 @pytest.mark.asyncio
