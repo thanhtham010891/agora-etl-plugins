@@ -8,7 +8,7 @@ import io
 import json
 import struct
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, cast
 from urllib import error, parse, request
 
 if TYPE_CHECKING:
@@ -256,8 +256,12 @@ class AvroSchemaRegistryDeserializer(Generic[T]):
 
         record = schemaless_reader(io.BytesIO(value[5:]), writer_schema, self._reader_schema)
         if self._record_mapper is None:
-            return record  # type: ignore[return-value]
-        return self._record_mapper(record)
+            return cast("T", record)
+        if not isinstance(record, dict):
+            raise TypeError(
+                "Schema-registry Avro deserializer expected a record object for record_mapper."
+            )
+        return self._record_mapper(cast("dict[str, Any]", record))
 
 
 def _normalize_schema_text(schema: dict[str, Any] | list[Any] | str) -> str:

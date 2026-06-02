@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import logstruct
 from agora.core.dlq import DLQRecord, DLQSink, DLQSource
@@ -46,7 +47,7 @@ def _record_to_hash(record: DLQRecord) -> dict[str, str]:
 
 
 def _decode_json(value: str | None) -> Any:
-    if value in (None, ""):
+    if value is None or value == "":
         return None
     try:
         return json.loads(value)
@@ -73,6 +74,7 @@ def _hash_to_record(payload: dict[str, str]) -> DLQRecord:
         max_attempts=(
             int(payload["max_attempts"]) if payload.get("max_attempts") not in (None, "") else None
         ),
+        _storage_id=cast("Any", payload.get("storage_key")),
     )
 
 
@@ -88,7 +90,7 @@ class RedisDLQSink(DLQSink):
     ) -> None:
         self._url = url
         self._key_prefix = key_prefix.rstrip(":")
-        self._client = None
+        self._client: Any | None = None
 
     async def open(self) -> None:
         try:
@@ -97,7 +99,7 @@ class RedisDLQSink(DLQSink):
             raise ImportError(
                 "RedisDLQSink requires redis. Install via: pip install 'agora-etl-plugins[redis]'"
             ) from None
-        self._client = aioredis.from_url(self._url, decode_responses=True)
+        self._client = cast("Any", aioredis.from_url(self._url, decode_responses=True))
         logger.info("redis_dlq_ready", prefix=self._key_prefix)
 
     async def close(self) -> None:
@@ -106,49 +108,59 @@ class RedisDLQSink(DLQSink):
             self._client = None
 
     async def write(self, record: DLQRecord) -> None:
-        if self._client is None:
-            raise RuntimeError("RedisDLQSink.open() was not called")
+        client = self._require_client()
         record_key = self._record_key(record)
-        async with self._client.pipeline(transaction=False) as pipe:
-            pipe.hset(record_key, mapping=_record_to_hash(record))
+        object.__setattr__(record, "_storage_id", record_key)
+        payload = _record_to_hash(record)
+        payload["storage_key"] = record_key
+        async with client.pipeline(transaction=False) as pipe:
+            pipe.hset(record_key, mapping=payload)
             pipe.rpush(self._index_key, record_key)
             await pipe.execute()
 
     async def write_batch(self, records: list[DLQRecord]) -> None:
-        if self._client is None:
-            raise RuntimeError("RedisDLQSink.open() was not called")
+        client = self._require_client()
         if not records:
             return
-        async with self._client.pipeline(transaction=False) as pipe:
+        async with client.pipeline(transaction=False) as pipe:
             for record in records:
                 record_key = self._record_key(record)
-                pipe.hset(record_key, mapping=_record_to_hash(record))
+                object.__setattr__(record, "_storage_id", record_key)
+                payload = _record_to_hash(record)
+                payload["storage_key"] = record_key
+                pipe.hset(record_key, mapping=payload)
                 pipe.rpush(self._index_key, record_key)
             await pipe.execute()
 
     async def replay(self, record: DLQRecord) -> DLQRecord:
-        if self._client is None:
-            raise RuntimeError("RedisDLQSink.open() was not called")
+        client = self._require_client()
         updated = await super().replay(record)
-        await self._client.hset(self._record_key(record), mapping={"attempt": str(updated.attempt)})
+        await client.hset(self._record_key(record), mapping={"attempt": str(updated.attempt)})
         return updated
 
     async def acknowledge(self, record: DLQRecord) -> None:
-        if self._client is None:
-            raise RuntimeError("RedisDLQSink.open() was not called")
+        client = self._require_client()
         record_key = self._record_key(record)
-        await self._client.delete(record_key)
-        await self._client.lrem(self._index_key, 0, record_key)
+        await client.delete(record_key)
+        await client.lrem(self._index_key, 0, record_key)
 
     @property
     def _index_key(self) -> str:
         return f"{self._key_prefix}:__index__"
 
     def _record_key(self, record: DLQRecord) -> str:
+        storage_id = record._storage_id
+        if isinstance(storage_id, str) and storage_id:
+            return storage_id
         return (
             f"{self._key_prefix}:{record.pipeline_id}:{record.run_id}:"
-            f"{record.stage}:{record.created_at.isoformat()}"
+            f"{record.stage}:{record.created_at.isoformat()}:{uuid.uuid4().hex}"
         )
+
+    def _require_client(self) -> Any:
+        if self._client is None:
+            raise RuntimeError("RedisDLQSink.open() was not called")
+        return self._client
 
 
 class RedisDLQSource(DLQSource):
@@ -170,7 +182,7 @@ class RedisDLQSource(DLQSource):
         self._pipeline_id = pipeline_id
         self._stage = stage
         self._limit = limit
-        self._client = None
+        self._client: Any | None = None
 
     async def open(self) -> None:
         try:
@@ -179,7 +191,7 @@ class RedisDLQSource(DLQSource):
             raise ImportError(
                 "RedisDLQSource requires redis. Install via: pip install 'agora-etl-plugins[redis]'"
             ) from None
-        self._client = aioredis.from_url(self._url, decode_responses=True)
+        self._client = cast("Any", aioredis.from_url(self._url, decode_responses=True))
 
     async def close(self) -> None:
         if self._client is not None:
@@ -187,21 +199,20 @@ class RedisDLQSource(DLQSource):
             self._client = None
 
     async def _iter_records(self) -> AsyncGenerator[DLQRecord, None]:
-        if self._client is None:
-            raise RuntimeError("RedisDLQSource.open() was not called")
+        client = self._require_client()
 
         yielded = 0
         chunk_size = 100
         start = 0
         while True:
             end = start + chunk_size - 1
-            keys = await self._client.lrange(self._index_key, start, end)
+            keys = await client.lrange(self._index_key, start, end)
             if not keys:
                 return
 
             # Batch fetch chunked hashes to avoid N+1 round trips without
             # materializing the entire DLQ index into memory first.
-            async with self._client.pipeline(transaction=False) as pipe:
+            async with client.pipeline(transaction=False) as pipe:
                 for key in keys:
                     pipe.hgetall(key)
                 payloads = await pipe.execute()
@@ -224,6 +235,11 @@ class RedisDLQSource(DLQSource):
     @property
     def _index_key(self) -> str:
         return f"{self._key_prefix}:__index__"
+
+    def _require_client(self) -> Any:
+        if self._client is None:
+            raise RuntimeError("RedisDLQSource.open() was not called")
+        return self._client
 
 
 __all__ = ["RedisDLQSink", "RedisDLQSource"]

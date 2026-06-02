@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 (June 2, 2026)
+
+- Raised the core compatibility floor to `agora-etl>=0.2.1`
+- Updated plugin docs to highlight `DeliveryConfig(batch_size=100)` for Redis, Kafka, and PostgreSQL source pipelines on the linear lane
+- Documented that `BatchMiddleware` now works correctly with plugin sources that emit one record at a time, matching the `agora-etl 0.2.1` runtime fix
+- Added regression coverage for running a plugin source through `BatchMapMiddleware` on the linear lane
+
 ## 0.2.2 (May 27, 2026)
 
 - Reduced Kafka producer batch overhead by serializing synchronous batches eagerly and skipping the retry wrapper on the success path

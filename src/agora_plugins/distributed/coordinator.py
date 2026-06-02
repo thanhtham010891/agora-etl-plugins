@@ -18,6 +18,7 @@ import json
 import os
 import socket
 from datetime import UTC, datetime
+from typing import Any, cast
 from urllib.parse import urlparse
 
 import logstruct
@@ -106,9 +107,9 @@ class RedisWorkerCoordinator(WorkerCoordinator):
 
         self._worker_id: str = ""
         self._pipeline_ids: list[str] = []
-        self._redis: aioredis.Redis | None = None
+        self._redis: Any | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
-        self._release_script: aioredis.client.Script | None = None
+        self._release_script: Any | None = None
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ #
@@ -130,7 +131,7 @@ class RedisWorkerCoordinator(WorkerCoordinator):
         self._pipeline_ids = list(pipeline_ids)
 
         try:
-            self._redis = aioredis.from_url(self._redis_url, decode_responses=True)
+            self._redis = cast("Any", aioredis.from_url(self._redis_url, decode_responses=True))
             await self._redis.ping()
         except Exception as exc:
             if self._fallback_to_local:
@@ -286,7 +287,7 @@ class RedisWorkerCoordinator(WorkerCoordinator):
         """Open a read-only Redis connection for fleet inspection."""
         if self._redis is not None:
             return
-        self._redis = aioredis.from_url(self._redis_url, decode_responses=True)
+        self._redis = cast("Any", aioredis.from_url(self._redis_url, decode_responses=True))
         await self._redis.ping()
 
     async def close(self) -> None:

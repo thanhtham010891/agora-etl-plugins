@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from agora.core.dlq import DLQRecord
@@ -118,8 +119,12 @@ async def test_redis_dlq_sink_writes_hash_and_index(monkeypatch: pytest.MonkeyPa
     await sink.open()
     await sink.write(record)
 
-    record_key = "agora:test:dlq:orders:run-1:sink_write:2026-05-21T12:00:00+00:00"
+    record_key = client.lists["agora:test:dlq:__index__"][0]
+    assert record_key.startswith(
+        "agora:test:dlq:orders:run-1:sink_write:2026-05-21T12:00:00+00:00:"
+    )
     assert client.hashes[record_key]["error_message"] == "sink exploded"
+    assert client.hashes[record_key]["storage_key"] == record_key
     assert client.lists["agora:test:dlq:__index__"] == [record_key]
 
 
@@ -134,7 +139,7 @@ async def test_redis_dlq_sink_replay_updates_attempt(monkeypatch: pytest.MonkeyP
     await sink.write(record)
     updated = await sink.replay(record)
 
-    record_key = "agora:test:dlq:orders:run-1:sink_write:2026-05-21T12:00:00+00:00"
+    record_key = client.lists["agora:test:dlq:__index__"][0]
     assert updated.attempt == 2
     assert client.hashes[record_key]["attempt"] == "2"
 
@@ -150,7 +155,7 @@ async def test_redis_dlq_sink_acknowledge_removes_record(monkeypatch: pytest.Mon
     await sink.write(record)
     await sink.acknowledge(record)
 
-    record_key = "agora:test:dlq:orders:run-1:sink_write:2026-05-21T12:00:00+00:00"
+    record_key = cast("str", record._storage_id)
     assert record_key not in client.hashes
     assert client.lists["agora:test:dlq:__index__"] == []
 
@@ -210,3 +215,30 @@ async def test_redis_dlq_source_stops_after_limit_without_scanning_full_index(
 
     assert len(records) == 5
     assert client.lrange_calls == [("agora:test:dlq:__index__", 0, 99)]
+
+
+@pytest.mark.asyncio
+async def test_redis_dlq_acknowledge_only_removes_target_record_when_identity_collides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeAsyncRedis()
+    _install_fake_async_redis(monkeypatch, client)
+    sink = RedisDLQSink(url="redis://localhost:6379", key_prefix="agora:test:dlq")
+    created_at = datetime(2026, 5, 21, 12, 0, tzinfo=UTC)
+    first = _make_record(created_at=created_at, record={"id": 1})
+    second = _make_record(created_at=created_at, record={"id": 2})
+
+    await sink.open()
+    await sink.write(first)
+    await sink.write(second)
+
+    assert len(client.lists["agora:test:dlq:__index__"]) == 2
+    assert (
+        client.lists["agora:test:dlq:__index__"][0] != client.lists["agora:test:dlq:__index__"][1]
+    )
+
+    await sink.acknowledge(first)
+
+    remaining_key = client.lists["agora:test:dlq:__index__"][0]
+    assert len(client.lists["agora:test:dlq:__index__"]) == 1
+    assert client.hashes[remaining_key]["record"] == '{"id": 2}'

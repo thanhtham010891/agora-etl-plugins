@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections import deque
 from inspect import Parameter, isawaitable, iscoroutinefunction, signature
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 import logstruct
 from agora.core.retry import RetryPolicy, retry_async
@@ -136,13 +136,12 @@ class KafkaSink(BaseSink[T], Generic[T]):
             raise
 
     async def write_batch(self, records: list[T]) -> None:
-        if self._producer is None:
-            raise RuntimeError("KafkaSink.open() was not called")
+        self._require_producer()
         # Serialize entire batch first to avoid per-record coroutine switching
         if self._serializer_is_async:
             values = [await self._serialize(record) for record in records]
         else:
-            values = [self._serializer(record) for record in records]
+            values = [self._serialize_sync(record) for record in records]
         for i, record in enumerate(records):
             key = self._key_fn(record) if self._key_fn else None
             delivery = await self._send_with_retry(values[i], key=key)
@@ -182,11 +181,12 @@ class KafkaSink(BaseSink[T], Generic[T]):
         *,
         key: bytes | None,
     ) -> Any:
+        producer = self._require_producer()
         try:
-            return await self._producer.send(self._topic, value=value, key=key)
+            return await producer.send(self._topic, value=value, key=key)
         except self._retry_policy.retry_exceptions:
             return await retry_async(
-                lambda: self._producer.send(self._topic, value=value, key=key),
+                lambda: producer.send(self._topic, value=value, key=key),
                 policy=self._retry_policy,
                 on_retry=lambda attempt, exc, delay: logger.warning(
                     "kafka_sink_send_retry",
@@ -228,7 +228,14 @@ class KafkaSink(BaseSink[T], Generic[T]):
     async def _serialize(self, record: T) -> bytes:
         value = self._serializer(record)
         if self._serializer_is_async or isawaitable(value):
-            return await value
+            awaited = cast("Awaitable[bytes]", value)
+            return await awaited
+        return value
+
+    def _serialize_sync(self, record: T) -> bytes:
+        value = self._serializer(record)
+        if isawaitable(value):
+            raise TypeError("KafkaSink serializer returned awaitable on the synchronous path.")
         return value
 
     async def _open_serializer(self) -> None:
@@ -236,6 +243,11 @@ class KafkaSink(BaseSink[T], Generic[T]):
 
     async def _close_serializer(self) -> None:
         await call_lifecycle(self._serializer, "close")
+
+    def _require_producer(self) -> AIOKafkaProducer:
+        if self._producer is None:
+            raise RuntimeError("KafkaSink.open() was not called")
+        return self._producer
 
 
 __all__ = ["KafkaSink"]

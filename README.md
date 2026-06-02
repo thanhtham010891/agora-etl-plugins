@@ -20,13 +20,16 @@ Canonical ecosystem docs live in the Agora docs site:
 This README stays focused on package-specific quickstart information.
 
 ```python
-from agora import Pipeline
+from agora import DeliveryConfig, Pipeline
 from agora_plugins.redis.sources import RedisStreamSource
 from agora_plugins.redis.sinks import RedisSink
 
 summary = await (
     Pipeline(RedisStreamSource(url="redis://localhost:6379", stream="events", group="my-group", consumer="worker-1"))
-    .build(RedisSink(url="redis://localhost:6379", key_fn=lambda r: r["id"]))
+    .build(
+        RedisSink(url="redis://localhost:6379", key_fn=lambda r: r["id"]),
+        config=DeliveryConfig(batch_size=100),
+    )
     .run()
 )
 print(f"written={summary.records_written}  errors={summary.records_errored}")
@@ -43,6 +46,21 @@ pip install "agora-etl-plugins[distributed]"  # Redis-backed distributed worker 
 pip install "agora-etl-plugins[kafka]"        # Kafka source and sink
 pip install "agora-etl-plugins[postgres]"     # PostgreSQL source, sink, DLQ, schema adapter
 pip install "agora-etl-plugins[all]"          # Everything in one install
+```
+
+This package now targets `agora-etl>=0.2.1`.
+
+For plugin sources such as Redis Streams, Kafka, and PostgreSQL, `agora-etl 0.2.1`
+adds two core improvements worth adopting by default:
+
+- `DeliveryConfig(batch_size=100)` improves throughput on the linear lane.
+- `BatchMiddleware` now works correctly even when the source emits one record at a time.
+
+If your pipelines checkpoint frequently, you can also enable the Rust checkpoint hot path
+from the core package:
+
+```bash
+pip install "agora-etl[rs]" "agora-etl-plugins[redis]"
 ```
 
 ---
@@ -63,195 +81,6 @@ Full Redis integration — streaming ingestion, writes, dead-letter queue, state
 | `RedisStore` | Dedup | Exact-match deduplication via Redis SET NX |
 | `RedisEmbeddingStore` | Dedup | Semantic deduplication using cosine similarity (up to ~10k entries) |
 | `RedisLLMCache` | AI Cache | Distributed LLM response cache backed by Redis |
-
-```python
-from agora_plugins.redis.sources import RedisStreamSource
-from agora_plugins.redis.sinks import RedisSink
-from agora_plugins.redis.dlq import RedisDLQSink, RedisDLQSource
-from agora_plugins.redis.state import RedisBackend
-from agora_plugins.redis.dedup.stores import RedisStore, RedisEmbeddingStore
-from agora_plugins.redis.ai.cache import RedisLLMCache
-```
-
-#### RedisStreamSource
-
-At-least-once delivery via consumer groups. Acknowledges messages only after successful downstream write.
-
-```python
-source = RedisStreamSource(
-    url="redis://localhost:6379",
-    stream="agora:events",
-    group="pipeline-1",
-    consumer="worker-1",
-    deserializer=lambda fields: MyRecord(**fields),
-    batch_size=100,
-    block_ms=2000,
-    reclaim_idle_ms=60_000,   # reclaim stale pending messages from dead consumers
-)
-```
-
-#### RedisSink
-
-Supports four write modes: `set`, `lpush`, `rpush`, `xadd`.
-
-```python
-# Write as Redis Stream entries
-sink = RedisSink(
-    url="redis://localhost:6379",
-    key_fn=lambda r: "agora:processed",
-    serializer=lambda r: {"id": r["id"], "value": r["value"]},
-    mode="xadd",
-    maxlen=10_000,
-)
-
-# Write as key-value pairs with TTL
-sink = RedisSink(
-    url="redis://localhost:6379",
-    key_fn=lambda r: f"cache:{r['id']}",
-    serializer=lambda r: json.dumps(r),
-    mode="set",
-    ttl_seconds=3600,
-)
-```
-
-#### Dead-letter queue
-
-```python
-from agora_plugins.redis.dlq import RedisDLQSink, RedisDLQSource
-
-# Route failures to DLQ
-summary = await (
-    Pipeline(source)
-    .build(sink, dlq=RedisDLQSink(url="redis://localhost:6379"))
-    .run()
-)
-
-# Replay failed records
-dlq_source = RedisDLQSource(
-    url="redis://localhost:6379",
-    pipeline_id="my-pipeline",
-    stage="sink_write",
-)
-async for record in dlq_source.stream():
-    print(record.error_message)
-```
-
----
-
-### Cron `[cron]`
-
-Adds cron expression support to `ScheduledPipeline`. Without this plugin, only interval-based scheduling is available.
-
-```python
-from agora.runner import Schedule, ScheduledPipeline
-
-pipeline = ScheduledPipeline(
-    factory=lambda: my_pipeline,
-    schedule=Schedule.cron("0 9 * * 1-5"),  # weekdays at 9am
-)
-await pipeline.start()
-```
-
-Supported expression format: standard 5-field cron (`minute hour day month weekday`).
-
----
-
-### Distributed `[distributed]`
-
-Redis-backed distributed worker coordination. Prevents duplicate pipeline runs when multiple worker instances are deployed.
-
-Each worker acquires a per-pipeline lease before each run and releases it atomically via a Lua script. Workers register heartbeats so the fleet is visible via `agora plugins list`.
-
-```python
-from agora_plugins.distributed import RedisWorkerCoordinator, DistributedConfig
-from agora.runner import WorkerPool
-
-config = DistributedConfig()  # reads AGORA_DISTRIBUTED_* env vars
-coordinator = RedisWorkerCoordinator(
-    redis_url=config.redis_url,
-    lease_ttl_seconds=config.lease_ttl_seconds,
-    heartbeat_interval=config.heartbeat_interval,
-)
-
-pool = WorkerPool(coordinator=coordinator)
-pool.register(my_pipeline)
-await pool.run()
-```
-
-**Environment variables:**
-
-| Variable | Default | Description |
-|---|---|---|
-| `AGORA_DISTRIBUTED_REDIS_URL` | `redis://localhost:6379` | Redis connection URL |
-| `AGORA_DISTRIBUTED_LEASE_TTL_SECONDS` | `300` | Lease duration — must exceed longest pipeline run |
-| `AGORA_DISTRIBUTED_HEARTBEAT_INTERVAL` | `30` | Heartbeat interval in seconds |
-| `AGORA_DISTRIBUTED_KEY_PREFIX` | `agora:distributed:` | Redis key namespace |
-| `AGORA_DISTRIBUTED_FALLBACK_TO_LOCAL` | `false` | If `true`, continue without coordination when Redis is unavailable (risks duplicate runs) |
-
----
-
-### Kafka `[kafka]`
-
-Kafka source and sink built on `aiokafka`, with async serializers and bounded pending acknowledgements for backpressure-aware writes.
-
-```python
-import json
-
-from agora_plugins.kafka import KafkaSink, KafkaSource
-
-sink = KafkaSink(
-    topic="events",
-    bootstrap_servers="localhost:9092",
-    serializer=lambda record: json.dumps(record).encode(),
-)
-
-source = KafkaSource(
-    topics=["events"],
-    bootstrap_servers="localhost:9092",
-    group_id="agora-consumer",
-    deserializer=lambda payload: json.loads(payload.decode()),
-)
-```
-
-### PostgreSQL `[postgres]`
-
-PostgreSQL source, sink, DLQ, and schema adapter built on `psycopg`.
-
-```python
-from agora_plugins.postgres import PostgresSink, PostgresSource
-
-source = PostgresSource(
-    dsn="postgresql://localhost/agora",
-    query="SELECT id, name, score FROM public.events ORDER BY id",
-    row_mapper=lambda row: row,
-)
-
-sink = PostgresSink(
-    dsn="postgresql://localhost/agora",
-    table="public.events",
-    row_mapper=lambda record: record,
-    conflict_key="id",
-)
-```
-
----
-
-## Plugin auto-discovery
-
-Source and sink plugins register themselves via Python entry-points. After installing, run:
-
-```bash
-agora plugins list
-```
-
-to see the currently registered source, sink, and middleware plugins.
-
----
-
-## Requirements
-
-- Python 3.11+
-- `agora-etl >= 0.1.2`
 
 ---
 

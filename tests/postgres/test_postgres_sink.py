@@ -536,14 +536,15 @@ async def test_flush_reuses_internal_write_pool_connection_across_flushes() -> N
     assert created[0].commit_calls == 2
 
 
-def test_flatten_rows_rejects_mismatched_column_order() -> None:
+def test_flatten_rows_accepts_mismatched_column_order_with_same_columns() -> None:
     sink = _make_sink()
 
-    with pytest.raises(ValueError, match="identical column order"):
-        sink._flatten_rows(
-            [
-                {"slug": "a", "display_name": "A"},
-                {"display_name": "B", "slug": "b"},
-            ],
-            ["slug", "display_name"],
-        )
+    params = sink._flatten_rows(
+        [
+            {"slug": "a", "display_name": "A"},
+            {"display_name": "B", "slug": "b"},
+        ],
+        ["slug", "display_name"],
+    )
+
+    assert params == ["a", "A", "b", "B"]

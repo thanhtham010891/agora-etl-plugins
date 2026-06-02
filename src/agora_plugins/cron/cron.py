@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 try:
     import croniter as _croniter
 except ImportError as _exc:
@@ -18,7 +20,7 @@ def validate_cron_expression(expression: str) -> None:
 
 def seconds_until_next_run(expression: str, now: float) -> float:
     cron = _croniter.croniter(expression, now)
-    next_run = cron.get_next(float)
+    next_run = cast("float", cron.get_next(float))
     return max(next_run - now, 0.0)
 
 

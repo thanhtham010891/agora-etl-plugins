@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from agora import IterableSource, Pipeline
+from agora import DeliveryConfig, IterableSource, Pipeline
 from agora.core.types import DedupStoreFailurePolicy
 from agora.middlewares.dedup import DedupMiddleware
 
@@ -140,7 +140,7 @@ async def test_redis_dedup_fail_closed_routes_record_to_dlq_when_backend_is_unre
                     store=RedisStore(url="redis://127.0.0.1:1"),
                 )
             )
-            .build(sink, dlq=dlq)  # type: ignore[arg-type]
+            .build(sink, config=DeliveryConfig(dlq=dlq))  # type: ignore[arg-type]
             .run()
         ),
         timeout=_INTEGRATION_TIMEOUT_S,

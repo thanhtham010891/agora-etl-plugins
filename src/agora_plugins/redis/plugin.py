@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 
-from agora.core.registry import AGORA_API_VERSION
+from agora.core.registry import AGORA_PLUGIN_MANIFEST_VERSION
 
 
 @dataclass(frozen=True)
@@ -30,7 +30,7 @@ def _package_version() -> str:
 MANIFEST = PluginManifest(
     name="redis",
     version=_package_version(),
-    agora_api_version=AGORA_API_VERSION,
+    agora_api_version=AGORA_PLUGIN_MANIFEST_VERSION,
     package="agora-etl-plugins",
     capabilities=(
         "source:redis_dlq_source",

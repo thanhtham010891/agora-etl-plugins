@@ -10,7 +10,7 @@ import asyncio
 import re
 import uuid
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast
 from urllib.parse import urlparse
 
 import logstruct
@@ -19,9 +19,8 @@ from agora.core.sink import BaseSink
 from agora.schema.types import DataType
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncIterator, Callable, Iterator
 
-    import psycopg
     from agora.core.context import PipelineContext
     from agora.schema.types import Schema
 
@@ -136,13 +135,13 @@ class PostgresSink(BaseSink[T], Generic[T]):
         self._max_parameters_per_statement = max_parameters_per_statement
         self._retry_policy = retry_policy
         self._buffer: list[dict[str, Any]] = []
-        self._conn = None
+        self._conn: Any | None = None
         self._write_pool: asyncio.LifoQueue[Any] | None = None
         self._write_pool_open_connections = 0
         self._write_pool_lock = asyncio.Lock()
-        self._psycopg = None
+        self._psycopg: Any | None = None
 
-    async def _load_psycopg(self):
+    async def _load_psycopg(self) -> Any:
         if self._psycopg is None:
             try:
                 import psycopg
@@ -150,21 +149,21 @@ class PostgresSink(BaseSink[T], Generic[T]):
                 raise ImportError(
                     "PostgresSink requires psycopg. Install via: pip install 'agora-etl-plugins[postgres]'"
                 ) from None
-            self._psycopg = psycopg
+            self._psycopg = cast("Any", psycopg)
         return self._psycopg
 
-    async def _create_connection(self):
+    async def _create_connection(self) -> Any:
         psycopg = await self._load_psycopg()
         conn = await psycopg.AsyncConnection.connect(self._dsn, autocommit=False)
         logger.info("postgres_sink_connected", table=self._table, dsn=_redact_dsn(self._dsn))
         return conn
 
-    async def _get_conn(self) -> psycopg.AsyncConnection[Any]:
+    async def _get_conn(self) -> Any:
         if self._conn is None:
             self._conn = await self._create_connection()
         return self._conn
 
-    async def _acquire_write_conn(self):
+    async def _acquire_write_conn(self) -> tuple[Any, bool]:
         if self._pool_size <= 1:
             return await self._get_conn(), False
 
@@ -195,11 +194,11 @@ class PostgresSink(BaseSink[T], Generic[T]):
 
         return await self._write_pool.get(), True
 
-    async def _release_write_conn(self, conn, *, pooled: bool, discard: bool = False) -> None:
+    async def _release_write_conn(self, conn: Any, *, pooled: bool, discard: bool = False) -> None:
         if not pooled:
             if discard and self._conn is conn:
                 try:
-                    await conn.close()
+                    await cast("Any", conn).close()
                 except Exception:
                     pass
                 finally:
@@ -222,7 +221,7 @@ class PostgresSink(BaseSink[T], Generic[T]):
         self._write_pool.put_nowait(conn)
 
     @asynccontextmanager
-    async def _write_connection(self):
+    async def _write_connection(self) -> AsyncIterator[Any]:
         conn, pooled = await self._acquire_write_conn()
         discard = False
         try:
@@ -233,7 +232,7 @@ class PostgresSink(BaseSink[T], Generic[T]):
         finally:
             await self._release_write_conn(conn, pooled=pooled, discard=discard)
 
-    async def connection(self):
+    async def connection(self) -> Any:
         """Public API for obtaining the underlying connection (used by schema adapters)."""
         return await self._get_conn()
 
@@ -328,9 +327,9 @@ class PostgresSink(BaseSink[T], Generic[T]):
         expected_columns = tuple(columns)
         for row in rows:
             row_columns = tuple(row.keys())
-            if row_columns != expected_columns:
+            if set(row_columns) != set(expected_columns):
                 raise ValueError(
-                    "PostgresSink rows in the same batch must have identical column order. "
+                    "PostgresSink rows in the same batch must have identical column sets. "
                     f"Expected {expected_columns!r}, got {row_columns!r}."
                 )
             params.extend(row[column] for column in columns)
@@ -348,7 +347,7 @@ class PostgresSink(BaseSink[T], Generic[T]):
         self,
         rows: list[dict[str, Any]],
         columns: list[str],
-    ):
+    ) -> Iterator[list[dict[str, Any]]]:
         chunk_size = self._statement_row_limit(len(columns))
         for start in range(0, len(rows), chunk_size):
             yield rows[start : start + chunk_size]
@@ -594,16 +593,19 @@ class PostgresSchemaAdapter(BaseSink[T], Generic[T]):
 
         self._schema = schema
 
+        create_applied = True
         if self._auto_create:
-            await self._create_table_if_not_exists(ctx)
+            create_applied = await self._create_table_if_not_exists(ctx)
+        alter_applied = True
         if self._auto_alter:
-            await self._alter_table_add_columns(ctx)
+            alter_applied = await self._alter_table_add_columns(ctx)
 
-        self._applied_schema_hash = schema.hash
+        if create_applied and alter_applied:
+            self._applied_schema_hash = schema.hash
 
-    async def _create_table_if_not_exists(self, ctx: PipelineContext) -> None:
+    async def _create_table_if_not_exists(self, ctx: PipelineContext) -> bool:
         if self._schema is None:
-            return
+            return True
 
         conn = await self._get_connection()
         if conn is None:
@@ -612,7 +614,7 @@ class PostgresSchemaAdapter(BaseSink[T], Generic[T]):
                 message="Cannot get connection from wrapped sink",
                 sink=self.sink_name,
             )
-            return
+            return False
 
         table_name = self._schema.table
         where_sql, where_params = _table_lookup_condition(table_name)
@@ -628,7 +630,7 @@ class PostgresSchemaAdapter(BaseSink[T], Generic[T]):
             ctx.log.info("postgres_table_exists", table=table_name, sink=self.sink_name)
             self._table_created = True
             await self._load_existing_columns(ctx)
-            return
+            return True
 
         columns_sql: list[str] = []
         for col_name in sorted(self._schema.columns.keys()):
@@ -655,6 +657,7 @@ class PostgresSchemaAdapter(BaseSink[T], Generic[T]):
             )
             self._table_created = True
             self._existing_columns = set(self._schema.columns.keys())
+            return True
         except Exception as exc:
             await conn.rollback()
             ctx.log.exception(
@@ -665,20 +668,20 @@ class PostgresSchemaAdapter(BaseSink[T], Generic[T]):
             )
             raise
 
-    async def _alter_table_add_columns(self, ctx: PipelineContext) -> None:
+    async def _alter_table_add_columns(self, ctx: PipelineContext) -> bool:
         if self._schema is None or not self._table_created:
-            return
+            return True
 
         if not self._existing_columns:
             await self._load_existing_columns(ctx)
 
         new_columns = set(self._schema.columns.keys()) - self._existing_columns
         if not new_columns:
-            return
+            return True
 
         conn = await self._get_connection()
         if conn is None:
-            return
+            return False
 
         table_name = self._schema.table
         for col_name in sorted(new_columns):
@@ -711,6 +714,8 @@ class PostgresSchemaAdapter(BaseSink[T], Generic[T]):
                     error=str(exc),
                     sink=self.sink_name,
                 )
+                raise
+        return True
 
     async def _load_existing_columns(self, ctx: PipelineContext) -> None:
         if self._schema is None:

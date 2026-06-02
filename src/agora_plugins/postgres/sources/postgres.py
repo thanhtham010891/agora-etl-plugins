@@ -78,7 +78,7 @@ class PostgresSource(BaseSource[T], Generic[T]):
         self._record_error_count = 0
         self._record_drop_count = 0
 
-    async def prepare_resume(self, checkpoint) -> None:
+    async def prepare_resume(self, checkpoint: Any) -> None:
         self._reset_progress()
         self._params = dict(self._base_params)
         if checkpoint is None or not self.supports_checkpoint:
@@ -119,7 +119,7 @@ class PostgresSource(BaseSource[T], Generic[T]):
             record_drop_count=self._record_drop_count,
         )
 
-    async def stream(self) -> AsyncGenerator[T, None]:  # type: ignore[override]
+    async def stream(self) -> AsyncGenerator[T, None]:
         try:
             import psycopg
             from psycopg.rows import dict_row

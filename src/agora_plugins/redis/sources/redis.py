@@ -23,7 +23,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 import logstruct
 from agora.core.source import BaseSource, SourceRecordError, SourceRuntimeMetrics
@@ -64,9 +64,15 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
         self._stream = stream
         self._group = group
         self._consumer = consumer
-        self._deserializer: Callable[[dict[str, Any]], T] = (
-            deserializer or (lambda d: d)  # type: ignore[return-value]
-        )
+        self._deserializer: Callable[[dict[str, Any]], T]
+        if deserializer is None:
+
+            def _identity(payload: dict[str, Any]) -> T:
+                return cast("T", payload)
+
+            self._deserializer = _identity
+        else:
+            self._deserializer = deserializer
         self._block_ms = block_ms
         self._batch_size = batch_size
         self._ack_on_success = ack_on_success
@@ -77,7 +83,7 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
         )
         self._reclaim_batch_size = max(1, reclaim_batch_size or batch_size)
         self._on_deserialize_error = on_deserialize_error
-        self._client = None
+        self._client: Any | None = None
         self._last_message_id: str | None = None
         self._resume_cursor: str | None = None
         self._resume_pending = False
@@ -96,10 +102,13 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
                 "RedisStreamSource requires redis. Install via: pip install 'agora-etl-plugins[redis]'"
             ) from None
 
-        self._client = aioredis.from_url(self._url, decode_responses=self._decode_responses)
+        self._client = cast(
+            "Any", aioredis.from_url(self._url, decode_responses=self._decode_responses)
+        )
 
         try:
-            await self._client.xgroup_create(self._stream, self._group, id="0", mkstream=True)
+            client = self._require_client()
+            await client.xgroup_create(self._stream, self._group, id="0", mkstream=True)
             logger.info(
                 "redis_stream_group_created",
                 stream=self._stream,
@@ -136,9 +145,8 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
         self._resume_cursor = message_id
         self._resume_pending = True
 
-    async def stream(self) -> AsyncGenerator[T, None]:  # type: ignore[override]
-        if self._client is None:
-            raise RuntimeError("RedisStreamSource.open() was not called")
+    async def stream(self) -> AsyncGenerator[T, None]:
+        client = self._require_client()
         self._record_error_count = 0
         self._record_drop_count = 0
 
@@ -158,7 +166,7 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
 
             stream_id = self._resume_cursor if self._resume_pending and self._resume_cursor else ">"
             try:
-                entries = await self._client.xreadgroup(
+                entries = await client.xreadgroup(
                     self._group,
                     self._consumer,
                     {self._stream: stream_id},
@@ -276,7 +284,9 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
                         exc,
                         record={
                             "message_id": normalized_message_id,
-                            "fields": self._normalize_error_fields(fields),
+                            "fields": self._normalize_error_fields(
+                                cast("Mapping[str | bytes, Any]", fields)
+                            ),
                         },
                         checkpoint=self.current_checkpoint(),
                         source=self.source_name,
@@ -302,10 +312,11 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
             await self._flush_pending_acks()
 
     async def _flush_pending_acks(self) -> None:
-        if self._client is None or not self._pending_ack_ids:
+        client = self._client
+        if client is None or not self._pending_ack_ids:
             return
         pending_ids, self._pending_ack_ids = self._pending_ack_ids, []
-        await self._client.xack(self._stream, self._group, *pending_ids)
+        await client.xack(self._stream, self._group, *pending_ids)
 
     @staticmethod
     def _normalize_message_id(msg_id: str | bytes) -> str:
@@ -343,6 +354,11 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
         if not isinstance(messages, list):
             return parsed_cursor, []
         return parsed_cursor, messages
+
+    def _require_client(self) -> Any:
+        if self._client is None:
+            raise RuntimeError("RedisStreamSource.open() was not called")
+        return self._client
 
 
 __all__ = ["RedisStreamSource"]

@@ -8,7 +8,7 @@ Requires: ``pip install 'agora-etl-plugins[redis]'``
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 from urllib.parse import urlparse
 
 import logstruct
@@ -62,7 +62,7 @@ class RedisSink(BaseSink[T], Generic[T]):
         self._mode = mode
         self._ttl = ttl_seconds
         self._maxlen = maxlen
-        self._client = None
+        self._client: Any | None = None
         self._xadd_kwargs: dict[str, Any] = {}
         if maxlen is not None:
             self._xadd_kwargs = {"maxlen": maxlen, "approximate": True}
@@ -74,7 +74,7 @@ class RedisSink(BaseSink[T], Generic[T]):
             raise ImportError(
                 "RedisSink requires redis. Install via: pip install 'agora-etl-plugins[redis]'"
             ) from None
-        self._client = aioredis.from_url(self._url)
+        self._client = cast("Any", aioredis.from_url(self._url))
         logger.info("redis_sink_ready", url=_redact_url(self._url), mode=self._mode)
 
     async def close(self) -> None:
@@ -101,15 +101,16 @@ class RedisSink(BaseSink[T], Generic[T]):
 
     async def _client_command(self, key: str, value: Any) -> None:
         """Execute the configured write command directly on the async client."""
+        client = self._require_client()
         if self._mode == "set":
             if self._ttl is not None:
-                await self._client.set(key, value, ex=self._ttl)  # type: ignore[union-attr]
+                await client.set(key, value, ex=self._ttl)
             else:
-                await self._client.set(key, value)  # type: ignore[union-attr]
+                await client.set(key, value)
         elif self._mode == "lpush":
-            await self._client.lpush(key, value)  # type: ignore[union-attr]
+            await client.lpush(key, value)
         elif self._mode == "rpush":
-            await self._client.rpush(key, value)  # type: ignore[union-attr]
+            await client.rpush(key, value)
         elif self._mode == "xadd":
             if not isinstance(value, dict):
                 raise TypeError("RedisSink mode='xadd' requires serializer to return a dict")
@@ -117,7 +118,7 @@ class RedisSink(BaseSink[T], Generic[T]):
             if self._maxlen is not None:
                 xadd_kwargs["maxlen"] = self._maxlen
                 xadd_kwargs["approximate"] = True
-            await self._client.xadd(key, value, **xadd_kwargs)  # type: ignore[union-attr]
+            await client.xadd(key, value, **xadd_kwargs)
 
     async def write(self, record: T) -> None:
         if self._client is None:
@@ -128,22 +129,26 @@ class RedisSink(BaseSink[T], Generic[T]):
         logger.debug("redis_sink_write", mode=self._mode, key=key)
 
     async def write_batch(self, records: list[T]) -> None:
-        if self._client is None:
-            raise RuntimeError("RedisSink.open() was not called")
+        client = self._require_client()
         if not records:
             return
         if self._mode == "set" and self._ttl is None:
             mapping = {self._key_fn(record): self._serializer(record) for record in records}
-            await self._client.mset(mapping)
+            await client.mset(mapping)
             logger.debug("redis_sink_write_batch_mset", count=len(mapping))
             return
-        async with self._client.pipeline(transaction=False) as pipe:
+        async with client.pipeline(transaction=False) as pipe:
             for record in records:
                 key = self._key_fn(record)
                 value = self._serializer(record)
                 self._pipe_command(pipe, key, value)
             await pipe.execute()
         logger.debug("redis_sink_write_batch", mode=self._mode, count=len(records))
+
+    def _require_client(self) -> Any:
+        if self._client is None:
+            raise RuntimeError("RedisSink.open() was not called")
+        return self._client
 
 
 def _default_serializer(record: Any) -> Any:

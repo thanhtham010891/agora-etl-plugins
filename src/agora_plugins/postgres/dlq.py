@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
-
-    import psycopg
 
 import logstruct
 from agora.core.dlq import DLQRecord, DLQSink, DLQSource
@@ -127,7 +125,7 @@ class PostgresDLQSink(DLQSink):
     ) -> None:
         self._dsn = dsn
         self._table = table
-        self._conn = None
+        self._conn: Any | None = None
         self._table_ready = False
 
     async def open(self) -> None:
@@ -150,17 +148,21 @@ class PostgresDLQSink(DLQSink):
         updated = await super().replay(record)
         conn = await self._get_conn()
         table_sql = _quote_identifier(self._table, allow_path=True)
-        sql = (
-            f"UPDATE {table_sql} SET attempt = %s "
-            "WHERE pipeline_id = %s AND run_id = %s AND stage = %s AND created_at = %s"
-        )
-        params = (
-            updated.attempt,
-            record.pipeline_id,
-            record.run_id,
-            record.stage,
-            record.created_at,
-        )
+        if record._storage_id is not None:
+            sql = f"UPDATE {table_sql} SET attempt = %s WHERE id = %s"
+            params: tuple[Any, ...] = (updated.attempt, record._storage_id)
+        else:
+            sql = (
+                f"UPDATE {table_sql} SET attempt = %s "
+                "WHERE pipeline_id = %s AND run_id = %s AND stage = %s AND created_at = %s"
+            )
+            params = (
+                updated.attempt,
+                record.pipeline_id,
+                record.run_id,
+                record.stage,
+                record.created_at,
+            )
         try:
             async with conn.cursor() as cur:
                 await cur.execute(sql, params)
@@ -173,16 +175,20 @@ class PostgresDLQSink(DLQSink):
     async def acknowledge(self, record: DLQRecord) -> None:
         conn = await self._get_conn()
         table_sql = _quote_identifier(self._table, allow_path=True)
-        sql = (
-            f"DELETE FROM {table_sql} "
-            "WHERE pipeline_id = %s AND run_id = %s AND stage = %s AND created_at = %s"
-        )
-        params = (
-            record.pipeline_id,
-            record.run_id,
-            record.stage,
-            record.created_at,
-        )
+        if record._storage_id is not None:
+            sql = f"DELETE FROM {table_sql} WHERE id = %s"
+            params: tuple[Any, ...] = (record._storage_id,)
+        else:
+            sql = (
+                f"DELETE FROM {table_sql} "
+                "WHERE pipeline_id = %s AND run_id = %s AND stage = %s AND created_at = %s"
+            )
+            params = (
+                record.pipeline_id,
+                record.run_id,
+                record.stage,
+                record.created_at,
+            )
         try:
             async with conn.cursor() as cur:
                 await cur.execute(sql, params)
@@ -198,18 +204,23 @@ class PostgresDLQSink(DLQSink):
         columns_sql = ", ".join(_quote_identifier(column) for column in _DLQ_COLUMNS)
         placeholders_sql = ", ".join(["%s"] * len(_DLQ_COLUMNS))
         sql = f"INSERT INTO {table_sql} ({columns_sql}) VALUES ({placeholders_sql})"
+        params_batch = [
+            tuple(_record_to_row(record)[column] for column in _DLQ_COLUMNS) for record in records
+        ]
         try:
             async with conn.cursor() as cur:
-                for record in records:
-                    row = _record_to_row(record)
-                    params = tuple(row[column] for column in _DLQ_COLUMNS)
-                    await cur.execute(sql, params)
+                executemany = getattr(cur, "executemany", None)
+                if callable(executemany):
+                    await executemany(sql, params_batch)
+                else:
+                    for params in params_batch:
+                        await cur.execute(sql, params)
             await conn.commit()
         except Exception:
             await conn.rollback()
             raise
 
-    async def _get_conn(self) -> psycopg.AsyncConnection[Any]:
+    async def _get_conn(self) -> Any:
         if self._conn is None:
             try:
                 import psycopg
@@ -217,7 +228,9 @@ class PostgresDLQSink(DLQSink):
                 raise ImportError(
                     "PostgresDLQSink requires psycopg. Install via: pip install 'agora-etl-plugins[postgres]'"
                 ) from None
-            self._conn = await psycopg.AsyncConnection.connect(self._dsn, autocommit=False)
+            self._conn = cast(
+                "Any", await psycopg.AsyncConnection.connect(self._dsn, autocommit=False)
+            )
             logger.info(
                 "postgres_dlq_sink_connected", table=self._table, dsn=_redact_dsn(self._dsn)
             )
@@ -279,7 +292,7 @@ class PostgresDLQSource(DLQSource):
         self._pipeline_id = pipeline_id
         self._stage = stage
         self._limit = limit
-        self._conn = None
+        self._conn: Any | None = None
 
     async def open(self) -> None:
         await self._get_conn()
@@ -303,7 +316,7 @@ class PostgresDLQSource(DLQSource):
         where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         table_sql = _quote_identifier(self._table, allow_path=True)
         columns_sql = ", ".join(_quote_identifier(column) for column in _DLQ_COLUMNS)
-        sql = f"SELECT {columns_sql} FROM {table_sql} {where_sql} ORDER BY created_at ASC"
+        sql = f"SELECT id, {columns_sql} FROM {table_sql} {where_sql} ORDER BY created_at ASC"
         if self._limit is not None:
             sql += " LIMIT %s"
             params.append(self._limit)
@@ -315,9 +328,12 @@ class PostgresDLQSource(DLQSource):
                 if not rows:
                     break
                 for row in rows:
-                    yield _row_to_record(dict(row))
+                    payload = dict(row)
+                    record = _row_to_record(payload)
+                    object.__setattr__(record, "_storage_id", payload.get("id"))
+                    yield record
 
-    async def _get_conn(self) -> psycopg.AsyncConnection[Any]:
+    async def _get_conn(self) -> Any:
         if self._conn is None:
             try:
                 import psycopg
@@ -326,7 +342,9 @@ class PostgresDLQSource(DLQSource):
                 raise ImportError(
                     "PostgresDLQSource requires psycopg. Install via: pip install 'agora-etl-plugins[postgres]'"
                 ) from None
-            self._conn = await psycopg.AsyncConnection.connect(self._dsn, row_factory=dict_row)
+            self._conn = cast(
+                "Any", await psycopg.AsyncConnection.connect(self._dsn, row_factory=dict_row)
+            )
         return self._conn
 
 

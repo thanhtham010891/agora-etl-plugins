@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import math
 import time
-from typing import cast
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 from agora.state.backend import StateBackend, StateValue, StoredValue
 
@@ -38,7 +41,7 @@ class RedisBackend(StateBackend):
         self._prefix = prefix
 
     def get(self, key: str) -> StoredValue | None:
-        payload = self._redis.get(self._key(key))
+        payload = cast("str | None", self._redis.get(self._key(key)))
         if payload is None:
             return None
         data = cast("dict[str, StateValue | float | None]", json.loads(payload))
@@ -46,7 +49,7 @@ class RedisBackend(StateBackend):
         if expires_at is not None and time.time() >= expires_at:
             self.delete(key)
             return None
-        return StoredValue(value=cast("StateValue", data.get("value")), expires_at=expires_at)
+        return StoredValue(value=data.get("value"), expires_at=expires_at)
 
     def set(self, key: str, value: StateValue, *, expires_at: float | None = None) -> None:
         payload = json.dumps({"value": value, "expires_at": expires_at}, ensure_ascii=False)
@@ -73,8 +76,7 @@ class RedisBackend(StateBackend):
         if ttl_ms is None:
             return bool(self._redis.set(redis_key, payload, nx=True))
         if ttl_ms <= 0:
-            self._redis.delete(redis_key)
-            return True
+            return self.get(key) is None
         return bool(self._redis.set(redis_key, payload, nx=True, px=ttl_ms))
 
     def delete(self, key: str) -> None:
@@ -96,9 +98,9 @@ class RedisBackend(StateBackend):
     def _key(self, key: str) -> str:
         return f"{self._prefix}{key}"
 
-    def _scan_prefixed_keys(self, prefix: str):
+    def _scan_prefixed_keys(self, prefix: str) -> Iterator[str]:
         match = self._key(f"{prefix}*")
-        yield from self._redis.scan_iter(match=match)
+        yield from cast("Iterator[str]", self._redis.scan_iter(match=match))
 
     @staticmethod
     def _ttl_ms(expires_at: float | None) -> int | None:

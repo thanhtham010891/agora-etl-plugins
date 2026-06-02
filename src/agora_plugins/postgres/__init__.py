@@ -1,5 +1,7 @@
 """Official PostgreSQL plugin package for Agora."""
 
+from typing import Any
+
 from agora_plugins.postgres.config import PostgresConfig, PostgresPluginConfig
 from agora_plugins.postgres.plugin import MANIFEST, PluginManifest
 
@@ -16,7 +18,7 @@ __all__ = [
 ]
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     if name in {"PostgresSchemaAdapter", "PostgresSink"}:
         from agora_plugins.postgres.sinks.postgres import PostgresSchemaAdapter, PostgresSink
 

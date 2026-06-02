@@ -13,11 +13,16 @@ from agora_plugins.postgres.dlq import PostgresDLQSink, PostgresDLQSource
 class _FakeCursor:
     def __init__(self) -> None:
         self.calls: list[tuple[str, object | None]] = []
+        self.executemany_calls: list[tuple[str, list[object]]] = []
         self.rows: list[dict[str, object]] = []
         self._fetched = False
 
     async def execute(self, sql: str, params: object | None = None) -> None:
         self.calls.append((sql, params))
+        self._fetched = False
+
+    async def executemany(self, sql: str, params_seq: list[object]) -> None:
+        self.executemany_calls.append((sql, params_seq))
         self._fetched = False
 
     async def fetchmany(self, size: int = 1) -> list[dict[str, object]]:
@@ -94,10 +99,10 @@ async def test_postgres_dlq_sink_inserts_serialized_record(monkeypatch: pytest.M
     await sink.write(_make_record())
 
     assert connection.commit_calls == 2
-    insert_sql, insert_params = connection.cursor_obj.calls[-1]
+    insert_sql, insert_params = connection.cursor_obj.executemany_calls[-1]
     assert 'INSERT INTO "agora_dlq"' in insert_sql
     assert insert_params is not None
-    assert '"id": 1' in insert_params[5]
+    assert '"id": 1' in insert_params[0][5]
 
 
 @pytest.mark.asyncio
@@ -178,3 +183,21 @@ async def test_postgres_dlq_source_reads_records_with_filters(
     select_sql, select_params = connection.cursor_obj.calls[-1]
     assert 'FROM "agora_dlq"' in select_sql
     assert select_params == ["orders", "sink_write", 10]
+
+
+@pytest.mark.asyncio
+async def test_postgres_dlq_acknowledge_prefers_storage_id_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _FakeConnection()
+    _install_fake_psycopg(monkeypatch, connection)
+    sink = PostgresDLQSink(dsn="postgresql://example.invalid/db", table="agora_dlq")
+    record = _make_record()
+    object.__setattr__(record, "_storage_id", 42)
+
+    await sink.open()
+    await sink.acknowledge(record)
+
+    sql, params = connection.cursor_obj.calls[-1]
+    assert 'DELETE FROM "agora_dlq" WHERE id = %s' in sql
+    assert params == (42,)

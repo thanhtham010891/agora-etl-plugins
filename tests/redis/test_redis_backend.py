@@ -108,3 +108,14 @@ def test_redis_backend_set_if_absent_with_expired_ttl_does_not_block_future_writ
     assert "agora:test:alpha" not in fake._values
     assert backend.set_if_absent("alpha", {"count": 2}) is True
     assert backend.get("alpha") == StoredValue(value={"count": 2}, expires_at=None)
+
+
+def test_redis_backend_expired_set_if_absent_does_not_delete_live_value(monkeypatch) -> None:
+    fake = _install_fake_redis_module(monkeypatch)
+    backend = RedisBackend(prefix="agora:test:")
+
+    backend.set("alpha", {"count": 1})
+
+    assert backend.set_if_absent("alpha", {"count": 2}, expires_at=time.time() - 1) is False
+    assert backend.get("alpha") == StoredValue(value={"count": 1}, expires_at=None)
+    assert fake._delete_calls == []

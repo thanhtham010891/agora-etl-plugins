@@ -1,9 +1,11 @@
 """PostgreSQL sources exposed by the official Agora plugin package."""
 
+from typing import Any
+
 __all__ = ["PostgresDLQSource", "PostgresSource"]
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     if name == "PostgresDLQSource":
         from agora_plugins.postgres.dlq import PostgresDLQSource
 

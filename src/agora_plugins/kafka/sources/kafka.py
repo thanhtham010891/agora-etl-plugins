@@ -13,7 +13,7 @@ import contextlib
 import importlib
 from collections.abc import Iterable
 from inspect import isawaitable
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 import logstruct
 from agora.core.source import BaseSource, SourceRecordError, SourceRuntimeMetrics
@@ -112,7 +112,8 @@ class KafkaSource(BaseSource[T], Generic[T]):
                 max_partition_fetch_bytes=self._max_partition_fetch_bytes,
                 **self._extra_config,
             )
-            await self._consumer.start()
+            consumer = cast("Any", self._consumer)
+            await consumer.start()
             logger.info(
                 "kafka_source_ready",
                 topics=self._topics,
@@ -243,7 +244,7 @@ class KafkaSource(BaseSource[T], Generic[T]):
         finally:
             await self._commit_if_needed(force=True)
 
-    async def prepare_resume(self, checkpoint) -> None:
+    async def prepare_resume(self, checkpoint: Any) -> None:
         self._resume_applied = False
         self._resume_offsets = {}
         if checkpoint is None or not isinstance(checkpoint.value, dict):
@@ -300,12 +301,14 @@ class KafkaSource(BaseSource[T], Generic[T]):
     ) -> bool:
         if not assignments:
             return False
-        for item in assignments:
+        for item in cast("Iterable[Any]", assignments):
             item_topic = getattr(item, "topic", None)
             item_partition = getattr(item, "partition", None)
             if item_topic is None and isinstance(item, tuple) and len(item) >= 2:
                 item_topic = item[0]
                 item_partition = item[1]
+            if item_partition is None:
+                continue
             if item_topic == topic and int(item_partition) == partition:
                 return True
         return False

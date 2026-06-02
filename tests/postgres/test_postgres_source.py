@@ -4,7 +4,14 @@ import sys
 from types import SimpleNamespace
 
 import pytest
-from agora import Checkpoint, SourceRecordError, SourceRecordFailurePolicy
+from agora import (
+    BatchMapMiddleware,
+    Checkpoint,
+    DeliveryConfig,
+    Pipeline,
+    SourceRecordError,
+    SourceRecordFailurePolicy,
+)
 
 from agora_plugins.postgres.sources import PostgresSource
 
@@ -48,6 +55,25 @@ class _FakeConnection:
 
     def cursor(self) -> _FakeCursor:
         return self._cursor
+
+
+class _CollectSink:
+    sink_name = "collect"
+
+    def __init__(self) -> None:
+        self.records: list[int] = []
+
+    async def open(self) -> None:
+        return None
+
+    async def write(self, record: int) -> None:
+        self.records.append(record)
+
+    async def flush(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
 
 
 @pytest.mark.asyncio
@@ -129,6 +155,44 @@ async def test_postgres_source_without_checkpoint_config_keeps_row_progress(
 
     assert records == [1, 2]
     assert source.current_checkpoint() == {"row_number": 2}
+
+
+@pytest.mark.asyncio
+async def test_postgres_source_supports_batch_middleware_on_linear_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cursor = _FakeCursor([{"id": 1}, {"id": 2}, {"id": 3}], batch_size=2)
+    connection = _FakeConnection(cursor)
+
+    class _AsyncConnection:
+        @staticmethod
+        async def connect(*args, **kwargs):
+            del args, kwargs
+            return connection
+
+    fake_psycopg = SimpleNamespace(AsyncConnection=_AsyncConnection)
+    fake_rows = SimpleNamespace(dict_row=object())
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+    monkeypatch.setitem(sys.modules, "psycopg.rows", fake_rows)
+
+    source = PostgresSource(
+        dsn="postgresql://example/test",
+        query="SELECT id FROM events ORDER BY id",
+        row_mapper=lambda row: row["id"],
+        batch_size=2,
+    )
+    sink = _CollectSink()
+
+    summary = await (
+        Pipeline(source)
+        .pipe(BatchMapMiddleware(lambda record: record * 10))
+        .build(sink, config=DeliveryConfig(batch_size=2))  # type: ignore[arg-type]
+        .run()
+    )
+
+    assert sink.records == [10, 20, 30]
+    assert summary.records_consumed == 3
+    assert summary.records_written == 3
 
 
 @pytest.mark.asyncio

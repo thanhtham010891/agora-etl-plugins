@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import struct
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import logstruct
 from agora.middlewares.dedup.stores.base import DedupStore
@@ -44,6 +45,7 @@ class RedisEmbeddingStore(DedupStore[str]):
         self._redis_prefix = redis_key_prefix
         self._max_entries = max_entries
         self._redis: AsyncRedis | None = None
+        self._mark_lock = asyncio.Lock()
 
     async def open(self) -> None:
         await self._ensure_redis()
@@ -53,16 +55,17 @@ class RedisEmbeddingStore(DedupStore[str]):
         return await self._redis_exists(query_embedding=embedding)
 
     async def add(self, key: str) -> None:
-        redis = await self._ensure_redis()
-        index_key = f"{self._redis_prefix}__index__"
-        current_size = await redis.scard(index_key)
-        if current_size >= self._max_entries:
-            raise RuntimeError(
-                f"RedisEmbeddingStore has reached max_entries={self._max_entries}. "
-                "Use a dedicated vector database for larger datasets."
-            )
         embedding = (await self._provider.embed(key)).embedding
         await self._redis_add(key, embedding)
+
+    async def mark_if_new(self, key: str, *, ttl_seconds: int | None = None) -> bool:
+        del ttl_seconds
+        embedding = (await self._provider.embed(key)).embedding
+        async with self._mark_lock:
+            if await self._redis_exists(query_embedding=embedding):
+                return False
+            await self._redis_add(key, embedding)
+            return True
 
     async def close(self) -> None:
         if self._redis is not None:
@@ -86,6 +89,13 @@ class RedisEmbeddingStore(DedupStore[str]):
         packed = struct.pack(f"{len(embedding)}{_FLOAT_FORMAT}", *embedding)
         field_key = f"{self._redis_prefix}{key}"
         index_key = f"{self._redis_prefix}__index__"
+        scard = cast("Any", redis.scard)
+        current_size = int(await scard(index_key))
+        if current_size >= self._max_entries:
+            raise RuntimeError(
+                f"RedisEmbeddingStore has reached max_entries={self._max_entries}. "
+                "Use a dedicated vector database for larger datasets."
+            )
         # Atomic pipeline: store embedding and add to index together
         async with redis.pipeline(transaction=False) as pipe:
             pipe.set(field_key, packed)

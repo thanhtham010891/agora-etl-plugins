@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import struct
 import sys
@@ -117,3 +118,31 @@ async def test_redis_embedding_store_scans_index_in_chunks(monkeypatch: pytest.M
         ("agora:dedup:emb:__index__", 0, 256),
         ("agora:dedup:emb:__index__", 1, 256),
     ]
+
+
+@pytest.mark.asyncio
+async def test_redis_embedding_store_mark_if_new_is_atomic() -> None:
+    class _FakeProvider:
+        async def embed(self, text: str):
+            return SimpleNamespace(embedding=[1.0, float(len(text))])
+
+    store = RedisEmbeddingStore(provider=_FakeProvider())
+    seen = False
+
+    async def _exists(*, query_embedding: list[float]) -> bool:
+        del query_embedding
+        await asyncio.sleep(0)
+        return seen
+
+    async def _add(key: str, embedding: list[float]) -> None:
+        del key, embedding
+        nonlocal seen
+        await asyncio.sleep(0)
+        seen = True
+
+    store._redis_exists = _exists  # type: ignore[method-assign]
+    store._redis_add = _add  # type: ignore[method-assign]
+
+    first, second = await asyncio.gather(store.mark_if_new("abc"), store.mark_if_new("abc"))
+
+    assert (first, second) == (True, False)

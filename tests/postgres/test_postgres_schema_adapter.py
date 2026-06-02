@@ -232,3 +232,45 @@ async def test_adapter_applies_schema_during_same_pipeline_run() -> None:
     assert any('ALTER TABLE "users" ADD COLUMN "name" TEXT NULL' in sql for sql in executed_sql)
     assert inner.records == [{"id": 1}, {"id": 2, "name": "Alice"}]
     assert summary.records_written == 2
+
+
+@pytest.mark.asyncio
+async def test_adapter_retries_schema_application_after_failed_alter() -> None:
+    conn, _cursor = _make_conn(table_exists=[(True,), (True,)], existing_columns=[("id",)])
+    inner = FakePostgresSink(conn)
+    adapter = PostgresSchemaAdapter(inner, auto_create=True, auto_alter=True)
+    ctx = _make_ctx()
+    ctx.extras["schema"] = Schema(
+        table="users",
+        columns={
+            "id": Column("id", DataType.INTEGER, nullable=False),
+            "name": Column("name", DataType.STRING, nullable=True),
+        },
+    )
+
+    alter_attempts = 0
+
+    async def _create_table_if_not_exists(_ctx: PipelineContext) -> bool:
+        adapter._table_created = True
+        adapter._existing_columns = {"id"}
+        return True
+
+    async def _alter_table_add_columns(_ctx: PipelineContext) -> bool:
+        nonlocal alter_attempts
+        alter_attempts += 1
+        if alter_attempts == 1:
+            raise RuntimeError("ddl failed once")
+        adapter._existing_columns.add("name")
+        return True
+
+    adapter._create_table_if_not_exists = AsyncMock(side_effect=_create_table_if_not_exists)  # type: ignore[method-assign]
+    adapter._alter_table_add_columns = AsyncMock(side_effect=_alter_table_add_columns)  # type: ignore[method-assign]
+
+    adapter.bind_context(ctx)
+    with pytest.raises(RuntimeError, match="ddl failed once"):
+        await adapter.open()
+
+    await adapter.write({"id": 1, "name": "Alice"})
+
+    assert alter_attempts == 2
+    assert inner.records == [{"id": 1, "name": "Alice"}]
