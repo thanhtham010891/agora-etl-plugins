@@ -7,6 +7,7 @@ agora_plugins.kafka.sinks.kafka
 from __future__ import annotations
 
 from collections import deque
+from functools import lru_cache
 from inspect import Parameter, isawaitable, iscoroutinefunction, signature
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
@@ -30,6 +31,17 @@ except ImportError:
 
 T = TypeVar("T")
 logger = logstruct.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _producer_supported_kwargs() -> set[str] | None:
+    try:
+        parameters = signature(AIOKafkaProducer.__init__).parameters
+    except (TypeError, ValueError):  # pragma: no cover
+        return None
+    if any(parameter.kind is Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return None
+    return set(parameters)
 
 
 class KafkaSink(BaseSink[T], Generic[T]):
@@ -65,7 +77,8 @@ class KafkaSink(BaseSink[T], Generic[T]):
         self._producer_kwargs.setdefault("enable_idempotence", True)
         if self._producer_kwargs["enable_idempotence"]:
             self._producer_kwargs.setdefault("acks", "all")
-            self._producer_kwargs.setdefault("max_in_flight_requests_per_connection", 5)
+            if self._supports_producer_kwarg("max_in_flight_requests_per_connection"):
+                self._producer_kwargs.setdefault("max_in_flight_requests_per_connection", 5)
             if self._producer_kwargs.get("acks") not in {"all", -1}:
                 raise ValueError("KafkaSink with idempotence enabled requires acks='all'")
         self._max_pending_acks = max_pending_acks
@@ -209,21 +222,20 @@ class KafkaSink(BaseSink[T], Generic[T]):
 
     def _supported_producer_kwargs(self) -> dict[str, Any]:
         kwargs = dict(self._producer_kwargs)
-        try:
-            parameters = signature(AIOKafkaProducer.__init__).parameters
-        except (TypeError, ValueError):  # pragma: no cover
+        supported = _producer_supported_kwargs()
+        if supported is None:
             return kwargs
-
-        if any(parameter.kind is Parameter.VAR_KEYWORD for parameter in parameters.values()):
-            return kwargs
-
-        supported = set(parameters)
 
         unsupported = [key for key in kwargs if key not in supported]
         for key in unsupported:
             logger.warning("kafka_sink_unsupported_producer_kwarg", kwarg=key, topic=self._topic)
             kwargs.pop(key, None)
         return kwargs
+
+    @staticmethod
+    def _supports_producer_kwarg(name: str) -> bool:
+        supported = _producer_supported_kwargs()
+        return supported is None or name in supported
 
     async def _serialize(self, record: T) -> bytes:
         value = self._serializer(record)

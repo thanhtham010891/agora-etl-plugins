@@ -39,10 +39,10 @@ check:  ## Lint + format check (no auto-fix, for CI)
 	$(RUFF) format --check .
 
 test:  ## Run all tests (excluding integration)
-	$(PYTEST) tests/ --ignore=tests/integration -q
+	PYTHONPATH=src $(PYTEST) tests/ --ignore=tests/integration -q
 
 test-all:  ## Run all tests including integration
-	$(PYTEST) tests/ -q
+	PYTHONPATH=src $(PYTEST) tests/ -q
 
 ci:  ## Full CI check: lint + format + tests
 	$(MAKE) check

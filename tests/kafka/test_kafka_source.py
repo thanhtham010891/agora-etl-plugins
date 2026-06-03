@@ -221,6 +221,26 @@ async def test_getmany_batches_messages_when_supported() -> None:
 
 
 @pytest.mark.asyncio
+async def test_getmany_can_exit_after_configured_idle_polls() -> None:
+    source = KafkaSource(
+        topics=["events"],
+        deserializer=lambda b: b.decode(),
+        enable_auto_commit=False,
+        commit_every=2,
+        poll_timeout_ms=10,
+        max_poll_records=10,
+        max_idle_polls=2,
+    )
+    consumer = _FakeBatchConsumer([[b"a", b"b"], [], []])
+    source._consumer = consumer  # type: ignore[attr-defined]
+
+    records = [record async for record in source.stream()]
+
+    assert records == ["a", "b"]
+    assert consumer.commit_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_prepare_resume_seeks_consumer_to_next_offset() -> None:
     source = KafkaSource(
         topics=["events"],

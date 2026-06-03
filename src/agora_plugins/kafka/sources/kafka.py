@@ -45,6 +45,7 @@ class KafkaSource(BaseSource[T], Generic[T]):
         enable_auto_commit: bool = False,
         commit_every: int = 100,
         poll_timeout_ms: int = 1000,
+        max_idle_polls: int | None = None,
         max_poll_records: int = 500,
         fetch_min_bytes: int = 1,
         fetch_max_wait_ms: int = 500,
@@ -63,6 +64,7 @@ class KafkaSource(BaseSource[T], Generic[T]):
         self._enable_auto_commit = enable_auto_commit
         self._commit_every = max(commit_every, 1)
         self._poll_timeout_ms = poll_timeout_ms
+        self._max_idle_polls = None if max_idle_polls is None else max(max_idle_polls, 1)
         self._max_poll_records = max_poll_records
         self._fetch_min_bytes = fetch_min_bytes
         self._fetch_max_wait_ms = fetch_max_wait_ms
@@ -189,6 +191,7 @@ class KafkaSource(BaseSource[T], Generic[T]):
                     yield message
                 return
 
+            idle_polls = 0
             while True:
                 try:
                     batches = await getmany(
@@ -197,6 +200,22 @@ class KafkaSource(BaseSource[T], Generic[T]):
                     )
                 except StopAsyncIteration:
                     return
+                if not any(batches.values()):
+                    if self._max_idle_polls is None:
+                        continue
+                    idle_polls += 1
+                    if idle_polls >= self._max_idle_polls:
+                        logger.info(
+                            "kafka_source_idle_exit",
+                            group_id=self._group_id,
+                            topics=self._topics,
+                            idle_polls=idle_polls,
+                            poll_timeout_ms=self._poll_timeout_ms,
+                        )
+                        return
+                    continue
+
+                idle_polls = 0
                 for messages in batches.values():
                     for message in messages:
                         yield message

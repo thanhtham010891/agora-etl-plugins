@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 (June 3, 2026)
+
+- Raised the core compatibility floor to `agora-etl>=0.2.2`
+- Updated package quickstart guidance to call out `DeliveryConfig(batch_flush_interval_ms=...)` for long-lived Redis, Kafka, and PostgreSQL source pipelines
+- Refreshed release metadata so the plugin bundle tracks the new long-lived worker observability and timed batch flush behavior in the core runtime
+
 ## 0.3.0 (June 2, 2026)
 
 - Raised the core compatibility floor to `agora-etl>=0.2.1`

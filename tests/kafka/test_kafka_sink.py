@@ -142,7 +142,11 @@ def test_kafka_sink_enables_idempotence_and_safe_defaults() -> None:
     assert sink._producer_kwargs["enable_idempotence"] is True  # type: ignore[attr-defined]
     assert sink._producer_kwargs["acks"] == "all"  # type: ignore[attr-defined]
     assert sink._producer_kwargs["compression_type"] == "gzip"  # type: ignore[attr-defined]
-    assert sink._producer_kwargs["max_in_flight_requests_per_connection"] == 5  # type: ignore[attr-defined]
+    supported = kafka_module._producer_supported_kwargs()
+    if supported is None or "max_in_flight_requests_per_connection" in supported:
+        assert sink._producer_kwargs["max_in_flight_requests_per_connection"] == 5  # type: ignore[attr-defined]
+    else:
+        assert "max_in_flight_requests_per_connection" not in sink._producer_kwargs  # type: ignore[attr-defined]
 
 
 def test_kafka_sink_rejects_unsafe_acks_with_idempotence() -> None:
@@ -160,6 +164,7 @@ async def test_kafka_sink_open_passes_stronger_defaults_to_producer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(kafka_module, "_AIOKAFKA_AVAILABLE", True)
+    kafka_module._producer_supported_kwargs.cache_clear()
     kwargs_seen: dict[str, Any] = {}
 
     class FakeProducer:
@@ -183,7 +188,11 @@ async def test_kafka_sink_open_passes_stronger_defaults_to_producer(
     assert kwargs_seen["enable_idempotence"] is True
     assert kwargs_seen["acks"] == "all"
     assert kwargs_seen["compression_type"] == "gzip"
-    assert kwargs_seen["max_in_flight_requests_per_connection"] == 5
+    supported = kafka_module._producer_supported_kwargs()
+    if supported is None or "max_in_flight_requests_per_connection" in supported:
+        assert kwargs_seen["max_in_flight_requests_per_connection"] == 5
+    else:
+        assert "max_in_flight_requests_per_connection" not in kwargs_seen
 
 
 @pytest.mark.asyncio
@@ -191,6 +200,7 @@ async def test_kafka_sink_open_filters_unsupported_producer_kwargs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(kafka_module, "_AIOKAFKA_AVAILABLE", True)
+    kafka_module._producer_supported_kwargs.cache_clear()
     kwargs_seen: dict[str, Any] = {}
 
     class FakeProducer:

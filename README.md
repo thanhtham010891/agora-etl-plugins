@@ -48,13 +48,17 @@ pip install "agora-etl-plugins[postgres]"     # PostgreSQL source, sink, DLQ, sc
 pip install "agora-etl-plugins[all]"          # Everything in one install
 ```
 
-This package now targets `agora-etl>=0.2.1`.
+This package now targets `agora-etl>=0.2.2`.
 
-For plugin sources such as Redis Streams, Kafka, and PostgreSQL, `agora-etl 0.2.1`
+For plugin sources such as Redis Streams, Kafka, and PostgreSQL, `agora-etl 0.2.2`
 adds two core improvements worth adopting by default:
 
 - `DeliveryConfig(batch_size=100)` improves throughput on the linear lane.
 - `BatchMiddleware` now works correctly even when the source emits one record at a time.
+
+For long-lived consumers that batch writes, `agora-etl 0.2.2` also adds
+`DeliveryConfig(batch_flush_interval_ms=...)` so partial sink batches can flush
+without forcing the worker run to end.
 
 If your pipelines checkpoint frequently, you can also enable the Rust checkpoint hot path
 from the core package:
