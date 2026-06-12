@@ -1,6 +1,6 @@
 # Agora ETL Plugins
 
-**Official plugin collection for [agora-etl](https://pypi.org/project/agora-etl/) — Redis, cron scheduling, distributed coordination, Kafka, and PostgreSQL.**
+**Official plugin collection for [agora-etl](https://pypi.org/project/agora-etl/) — Redis, cron scheduling, distributed coordination, Kafka, PostgreSQL, and Anthropic AI support.**
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
@@ -45,20 +45,25 @@ pip install "agora-etl-plugins[cron]"         # Cron schedule support for Schedu
 pip install "agora-etl-plugins[distributed]"  # Redis-backed distributed worker coordination
 pip install "agora-etl-plugins[kafka]"        # Kafka source and sink
 pip install "agora-etl-plugins[postgres]"     # PostgreSQL source, sink, DLQ, schema adapter
+pip install "agora-etl-plugins[anthropic]"    # Anthropic completion and structured-output provider
 pip install "agora-etl-plugins[all]"          # Everything in one install
 ```
 
-This package now targets `agora-etl>=0.2.2`.
+This package now targets `agora-etl>=0.3.3`.
 
-For plugin sources such as Redis Streams, Kafka, and PostgreSQL, `agora-etl 0.2.2`
-adds two core improvements worth adopting by default:
+For plugin sources such as Redis Streams, Kafka, and PostgreSQL, `agora-etl 0.3.3`
+adds three release-cycle improvements worth knowing about:
 
-- `DeliveryConfig(batch_size=100)` improves throughput on the linear lane.
-- `BatchMiddleware` now works correctly even when the source emits one record at a time.
+- config-driven workers can now build `WorkerPool` instances directly from
+  `agora/v1` TOML
+- OpenTelemetry tracing can be enabled from config with auto-wiring through the
+  existing tracing path
+- AI provider contracts now distinguish completion-only and embedding-capable
+  providers more honestly
 
-For long-lived consumers that batch writes, `agora-etl 0.2.2` also adds
-`DeliveryConfig(batch_flush_interval_ms=...)` so partial sink batches can flush
-without forcing the worker run to end.
+Anthropic is now part of the official bundle through the `anthropic` extra,
+with a completion and structured-output support story that stays explicit about
+the lack of embeddings.
 
 If your pipelines checkpoint frequently, you can also enable the Rust checkpoint hot path
 from the core package:
@@ -70,6 +75,29 @@ pip install "agora-etl[rs]" "agora-etl-plugins[redis]"
 ---
 
 ## Available plugins
+
+### Anthropic `[anthropic]`
+
+Official Anthropic AI provider support for completion-driven workflows and
+structured JSON output.
+
+| Component | Type | Description |
+|---|---|---|
+| `AnthropicProvider` | AI Provider | Claude-backed completion provider for enrichment, extraction, validation, translation, and classification in LLM mode |
+
+Example:
+
+```python
+from agora.middlewares.ai.enrich import AIEnrichMiddleware
+from agora_plugins.anthropic import AnthropicProvider
+
+provider = AnthropicProvider(model="claude-3-5-haiku-20241022")
+middleware = AIEnrichMiddleware(
+    provider=provider,
+    prompt_template="Review: {review_text}\nReturn JSON with keys summary and sentiment.",
+    output_fields=["summary", "sentiment"],
+)
+```
 
 ### Redis `[redis]`
 

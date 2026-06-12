@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agora-etl-plugins"
-version = "0.3.1"
-description = "Official plugins for agora-etl — Kafka, PostgreSQL, Redis, cron scheduling, and distributed coordination."
+version = "0.3.2"
+description = "Official plugins for agora-etl — Redis, cron scheduling, distributed coordination, Kafka, PostgreSQL, and Anthropic AI support."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
-keywords = ["etl", "pipeline", "async", "kafka", "postgres", "redis", "cron", "distributed", "data-engineering"]
+keywords = ["etl", "pipeline", "async", "kafka", "postgres", "redis", "cron", "distributed", "anthropic", "llm", "data-engineering"]
 authors = [
     { name = "Tham Tra" },
 ]
@@ -23,7 +23,7 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 dependencies = [
-    "agora-etl>=0.2.2,<1",
+    "agora-etl>=0.3.3,<1",
 ]
 
 [project.urls]
@@ -49,8 +49,11 @@ kafka = [
 postgres = [
     "psycopg[binary]>=3.1,<4",
 ]
+anthropic = [
+    "anthropic==0.99.0",
+]
 all = [
-    "agora-etl-plugins[redis,cron,distributed,kafka,postgres]",
+    "agora-etl-plugins[redis,cron,distributed,kafka,postgres,anthropic]",
 ]
 dev = [
     "agora-etl[dev]",
@@ -77,6 +80,9 @@ postgres_dlq = "agora_plugins.postgres.dlq:PostgresDLQSink"
 
 [project.entry-points."agora.ai.caches"]
 redis = "agora_plugins.redis.ai.cache:RedisLLMCache"
+
+[project.entry-points."agora.ai.providers"]
+anthropic = "agora_plugins.anthropic:AnthropicProvider"
 
 [project.entry-points."agora.middlewares.dedup.stores"]
 redis = "agora_plugins.redis.dedup.stores.redis:RedisStore"

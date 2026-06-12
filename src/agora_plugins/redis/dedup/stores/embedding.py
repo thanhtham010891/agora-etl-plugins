@@ -11,7 +11,7 @@ from agora.middlewares.dedup.stores.base import DedupStore
 from agora.utils.math import cosine_similarity as _cosine_similarity
 
 if TYPE_CHECKING:
-    from agora.ai.providers.base import AIProvider
+    from agora.ai.providers.base import EmbeddingProvider
     from redis.asyncio import Redis as AsyncRedis
 
 logger = logstruct.getLogger(__name__)
@@ -32,7 +32,7 @@ class RedisEmbeddingStore(DedupStore[str]):
 
     def __init__(
         self,
-        provider: AIProvider,
+        provider: EmbeddingProvider,
         *,
         similarity_threshold: float = 0.92,
         redis_url: str = "redis://localhost:6379",

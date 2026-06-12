@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, cast
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-from agora.state.backend import StateBackend, StateValue, StoredValue
+from agora.state import StateBackend, StateValue, StoredValue
 
 
 class RedisBackend(StateBackend):

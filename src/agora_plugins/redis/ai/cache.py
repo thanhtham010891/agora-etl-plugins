@@ -2,29 +2,27 @@
 
 from __future__ import annotations
 
-from agora.ai.cache import _BackendLLMCache
-from agora.core.constants import LLM_CACHE_DEFAULT_TTL_S, REDIS_DEFAULT_URL
-from agora.state import TTLKeyValueStore
+from agora.ai.cache import LLM_CACHE_DEFAULT_TTL_S, StateBackendLLMCache
 
 from agora_plugins.redis.state import RedisBackend
 
+_DEFAULT_REDIS_URL = "redis://localhost:6379"
 
-class RedisLLMCache(_BackendLLMCache):
+
+class RedisLLMCache(StateBackendLLMCache):
     """Redis-backed distributed cache."""
 
     def __init__(
         self,
-        url: str = REDIS_DEFAULT_URL,
+        url: str = _DEFAULT_REDIS_URL,
         *,
         key_prefix: str = "agora:llm:",
+        default_ttl_s: int = LLM_CACHE_DEFAULT_TTL_S,
     ) -> None:
-        backend = RedisBackend(url=url, prefix=key_prefix)
         super().__init__(
-            TTLKeyValueStore(
-                backend=backend,
-                namespace="llm",
-                default_ttl_s=LLM_CACHE_DEFAULT_TTL_S,
-            )
+            RedisBackend(url=url, prefix=key_prefix),
+            namespace="llm",
+            default_ttl_s=default_ttl_s,
         )
 
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2 (June 12, 2026)
+
+- Promoted Anthropic support into the official `agora-etl-plugins` bundle through the `anthropic` extra
+- Added the `agora.ai.providers` entry-point for `AnthropicProvider` under the `agora_plugins.anthropic` namespace
+- Raised the core compatibility floor to `agora-etl>=0.3.3`
+- Updated bundle docs and package quickstart guidance to position Anthropic as an official completion and structured-output integration
+- Added regression coverage for the official Anthropic provider path, including structured-output and unsupported-embedding behavior
+
 ## 0.3.1 (June 3, 2026)
 
 - Raised the core compatibility floor to `agora-etl>=0.2.2`

@@ -22,7 +22,7 @@ from typing import Any, cast
 from urllib.parse import urlparse
 
 import logstruct
-from agora.runner.coordinator import WorkerCoordinator, WorkerInfo
+from agora.runner import WorkerCoordinator, WorkerInfo
 
 logger = logstruct.getLogger(__name__)
 
