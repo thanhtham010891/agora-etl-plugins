@@ -1,0 +1,142 @@
+services:
+  redis-cluster-1:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--protected-mode",
+        "no",
+        "--bind",
+        "0.0.0.0",
+        "--port",
+        "6379",
+        "--cluster-enabled",
+        "yes",
+        "--cluster-config-file",
+        "nodes.conf",
+        "--cluster-node-timeout",
+        "5000",
+        "--cluster-announce-hostname",
+        "redis-cluster-1",
+        "--cluster-announce-port",
+        "6379",
+        "--cluster-announce-bus-port",
+        "16379",
+        "--cluster-preferred-endpoint-type",
+        "hostname",
+      ]
+    ports:
+      - "16385:6379"
+    volumes:
+      - redis_cluster_1_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis-cluster-2:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--protected-mode",
+        "no",
+        "--bind",
+        "0.0.0.0",
+        "--port",
+        "6379",
+        "--cluster-enabled",
+        "yes",
+        "--cluster-config-file",
+        "nodes.conf",
+        "--cluster-node-timeout",
+        "5000",
+        "--cluster-announce-hostname",
+        "redis-cluster-2",
+        "--cluster-announce-port",
+        "6379",
+        "--cluster-announce-bus-port",
+        "16379",
+        "--cluster-preferred-endpoint-type",
+        "hostname",
+      ]
+    ports:
+      - "16386:6379"
+    volumes:
+      - redis_cluster_2_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis-cluster-3:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--protected-mode",
+        "no",
+        "--bind",
+        "0.0.0.0",
+        "--port",
+        "6379",
+        "--cluster-enabled",
+        "yes",
+        "--cluster-config-file",
+        "nodes.conf",
+        "--cluster-node-timeout",
+        "5000",
+        "--cluster-announce-hostname",
+        "redis-cluster-3",
+        "--cluster-announce-port",
+        "6379",
+        "--cluster-announce-bus-port",
+        "16379",
+        "--cluster-preferred-endpoint-type",
+        "hostname",
+      ]
+    ports:
+      - "16387:6379"
+    volumes:
+      - redis_cluster_3_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis-cluster-init:
+    image: redis:7-alpine
+    depends_on:
+      redis-cluster-1:
+        condition: service_healthy
+      redis-cluster-2:
+        condition: service_healthy
+      redis-cluster-3:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        redis-cli --cluster create \
+          redis-cluster-1:6379 \
+          redis-cluster-2:6379 \
+          redis-cluster-3:6379 \
+          --cluster-replicas 0 \
+          --cluster-yes || true
+
+volumes:
+  redis_cluster_1_data:
+  redis_cluster_2_data:
+  redis_cluster_3_data:

@@ -25,7 +25,7 @@ jobs:
 
       - name: Validate release tag matches package version
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref }}
         run: |
           python - <<'PY'
           import os
@@ -46,10 +46,9 @@ jobs:
           PY
 
       - name: Setup environment
+        env:
+          BOOTSTRAP_PYTHON: python
         run: make setup
-
-      - name: Run CI
-        run: make ci
 
       - name: Build release distributions
         run: ./.venv/bin/hatch build

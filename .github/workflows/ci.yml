@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-and-typecheck:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Setup environment
+        env:
+          BOOTSTRAP_PYTHON: python
+        run: make setup
+
+      - name: Run non-integration CI
+        run: make ci
+
+      - name: Run installed-wheel release gate
+        env:
+          BOOTSTRAP_PYTHON: python
+        run: make test-release-gate-wheel
+
+  release-gate-base:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup environment
+        env:
+          BOOTSTRAP_PYTHON: python
+        run: make setup
+
+      - name: Start integration stack
+        run: make integration-up
+
+      - name: Show integration stack status
+        run: make integration-ps
+
+      - name: Run base release-gate slice
+        run: make test-release-gate-base
+
+      - name: Stop integration stack
+        if: always()
+        run: make integration-down

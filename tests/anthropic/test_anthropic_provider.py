@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import tomllib
 from pathlib import Path
@@ -26,6 +27,8 @@ def _install_fake_anthropic(
     response_text: str,
     input_tokens: int = 12,
     output_tokens: int = 7,
+    cache_read_input_tokens: int = 0,
+    cache_creation_input_tokens: int = 0,
 ) -> tuple[list[dict[str, object]], list[str]]:
     calls: list[dict[str, object]] = []
     api_keys: list[str] = []
@@ -37,6 +40,8 @@ def _install_fake_anthropic(
                 content=[SimpleNamespace(text=response_text)],
                 usage=SimpleNamespace(
                     input_tokens=input_tokens,
+                    cache_read_input_tokens=cache_read_input_tokens,
+                    cache_creation_input_tokens=cache_creation_input_tokens,
                     output_tokens=output_tokens,
                 ),
             )
@@ -52,6 +57,18 @@ def _install_fake_anthropic(
         SimpleNamespace(AsyncAnthropic=_FakeAsyncAnthropic),
     )
     return calls, api_keys
+
+
+def _anthropic_message(
+    text: str,
+    *,
+    input_tokens: int = 1,
+    output_tokens: int = 1,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        content=[SimpleNamespace(type="text", text=text)],
+        usage=SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens),
+    )
 
 
 def test_manifest_version_matches_bundle_metadata() -> None:
@@ -110,6 +127,23 @@ async def test_complete_returns_completion_response(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
+async def test_complete_counts_cached_input_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    _calls, _api_keys = _install_fake_anthropic(
+        monkeypatch,
+        response_text="cached",
+        input_tokens=10,
+        cache_read_input_tokens=3,
+        cache_creation_input_tokens=4,
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+    provider = AnthropicProvider(model="claude-3-5-haiku-20241022")
+    response = await provider.complete("Summarize this review")
+
+    assert response.input_tokens == 17
+
+
+@pytest.mark.asyncio
 async def test_complete_with_response_format_adds_schema_instruction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -135,6 +169,27 @@ async def test_complete_with_response_format_adds_schema_instruction(
 
 
 @pytest.mark.asyncio
+async def test_complete_with_response_format_returns_repaired_json_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_anthropic(
+        monkeypatch,
+        response_text='Here is the JSON:\n{"summary": "Good coffee", "sentiment": "positive"}\nDone.',
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "repair-key")
+
+    provider = AnthropicProvider()
+    response = await provider.complete(
+        "Label this cafe review",
+        response_format=_StructuredReview,
+        repair_invalid_json=True,
+    )
+
+    assert response.content == '{"summary": "Good coffee", "sentiment": "positive"}'
+    assert _StructuredReview.model_validate_json(response.content).sentiment == "positive"
+
+
+@pytest.mark.asyncio
 async def test_complete_raises_clear_error_for_invalid_structured_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -147,6 +202,688 @@ async def test_complete_raises_clear_error_for_invalid_structured_output(
         await provider.complete(
             "Label this cafe review",
             response_format=_StructuredReview,
+        )
+
+
+@pytest.mark.asyncio
+async def test_complete_retries_retryable_anthropic_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class _RateLimitError(RuntimeError):
+        status_code = 429
+
+    class _FakeMessages:
+        async def create(self, **kwargs: object) -> object:
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise _RateLimitError("rate limited")
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="ok")],
+                usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+            )
+
+    class _FakeAsyncAnthropic:
+        def __init__(self, *, api_key: str, max_retries: int = 0) -> None:
+            del api_key, max_retries
+            self.messages = _FakeMessages()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=_FakeAsyncAnthropic, RateLimitError=_RateLimitError),
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "retry-key")
+
+    provider = AnthropicProvider(max_retries=2, retry_initial_backoff_s=0)
+    response = await provider.complete("hello")
+
+    assert response.content == "ok"
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_complete_retry_honors_retry_after_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+    sleeps: list[float] = []
+
+    class _RateLimitError(RuntimeError):
+        status_code = 429
+
+        def __init__(self, message: str) -> None:
+            super().__init__(message)
+            self.headers = {"Retry-After": "2.5"}
+
+    class _FakeMessages:
+        async def create(self, **kwargs: object) -> object:
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise _RateLimitError("rate limited")
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="ok")],
+                usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+            )
+
+    class _FakeAsyncAnthropic:
+        def __init__(
+            self, *, api_key: str, max_retries: int = 0, timeout: float | None = None
+        ) -> None:
+            del api_key, max_retries, timeout
+            self.messages = _FakeMessages()
+
+    async def _fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=_FakeAsyncAnthropic, RateLimitError=_RateLimitError),
+    )
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "retry-after-key")
+
+    provider = AnthropicProvider(max_retries=2, retry_initial_backoff_s=0)
+    response = await provider.complete("hello")
+
+    assert response.content == "ok"
+    assert sleeps == [2.5]
+
+
+def test_retryable_error_does_not_retry_permanent_501_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=lambda **_kwargs: object()),
+    )
+    provider = AnthropicProvider(api_key="test-key")
+
+    class _NotImplementedError(RuntimeError):
+        status_code = 501
+        response = object()
+
+    assert provider._is_retryable_error(_NotImplementedError("not implemented")) is False
+
+
+def test_anthropic_retry_policy_uses_configured_jitter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=lambda **_kwargs: object()),
+    )
+
+    provider = AnthropicProvider(
+        api_key="test-key",
+        retry_initial_backoff_s=1.0,
+        retry_max_backoff_s=4.0,
+        retry_jitter_ratio=0.25,
+    )
+
+    assert provider._retry_policy.jitter_ratio == 0.25  # type: ignore[attr-defined]
+    assert provider._retry_policy.max_backoff_s == 4.0  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_complete_concatenates_multiple_text_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeMessages:
+        async def create(self, **kwargs: object) -> object:
+            del kwargs
+            return SimpleNamespace(
+                content=[
+                    SimpleNamespace(type="text", text="hello "),
+                    SimpleNamespace(type="text", text="world"),
+                ],
+                usage=SimpleNamespace(input_tokens=1, output_tokens=2),
+            )
+
+    class _FakeAsyncAnthropic:
+        def __init__(self, *, api_key: str, max_retries: int = 0) -> None:
+            del api_key, max_retries
+            self.messages = _FakeMessages()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=_FakeAsyncAnthropic),
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "blocks-key")
+
+    provider = AnthropicProvider()
+    response = await provider.complete("hello")
+
+    assert response.content == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_complete_raises_clear_error_when_response_is_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeMessages:
+        async def create(self, **kwargs: object) -> object:
+            del kwargs
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="{")],
+                stop_reason="max_tokens",
+                usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+            )
+
+    class _FakeAsyncAnthropic:
+        def __init__(self, *, api_key: str, max_retries: int = 0) -> None:
+            del api_key, max_retries
+            self.messages = _FakeMessages()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=_FakeAsyncAnthropic),
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "truncated-key")
+
+    provider = AnthropicProvider()
+
+    with pytest.raises(ValueError, match="max_tokens"):
+        await provider.complete("hello", max_tokens=1)
+
+
+@pytest.mark.asyncio
+async def test_complete_can_use_prompt_cache_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls, _api_keys = _install_fake_anthropic(monkeypatch, response_text="ok")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "cache-key")
+
+    provider = AnthropicProvider()
+    await provider.complete(
+        "summarize this",
+        system="stable system prompt",
+        cache_system_prompt=True,
+        cache_prompt=True,
+    )
+
+    assert calls[0]["system"] == [
+        {
+            "type": "text",
+            "text": "stable system prompt",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    assert calls[0]["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "summarize this",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_complete_can_force_structured_tool_use(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class _FakeMessages:
+        async def create(self, **kwargs: object) -> object:
+            calls.append(kwargs)
+            return SimpleNamespace(
+                content=[
+                    SimpleNamespace(
+                        type="tool_use",
+                        input={"summary": "Solid noodles", "sentiment": "positive"},
+                    )
+                ],
+                usage=SimpleNamespace(input_tokens=3, output_tokens=4),
+            )
+
+    class _FakeAsyncAnthropic:
+        def __init__(self, *, api_key: str, max_retries: int = 0) -> None:
+            del api_key, max_retries
+            self.messages = _FakeMessages()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=_FakeAsyncAnthropic),
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "tool-key")
+
+    provider = AnthropicProvider()
+    response = await provider.complete(
+        "Label this review",
+        response_format=_StructuredReview,
+        use_tool_for_response_format=True,
+    )
+
+    assert response.content == '{"summary":"Solid noodles","sentiment":"positive"}'
+    assert calls[0]["tool_choice"] == {"type": "tool", "name": "agora__structuredreview_response"}
+    assert calls[0]["tools"]
+
+
+@pytest.mark.asyncio
+async def test_complete_repairs_wrapped_json_for_structured_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_anthropic(
+        monkeypatch,
+        response_text='Here is the JSON:\n{"summary": "ok", "sentiment": "neutral"}\nDone.',
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "repair-key")
+
+    provider = AnthropicProvider()
+    response = await provider.complete("Label", response_format=_StructuredReview)
+
+    assert '"summary": "ok"' in response.content
+
+
+@pytest.mark.asyncio
+async def test_stream_complete_yields_text_deltas(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeStream:
+        async def __aenter__(self) -> _FakeStream:
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            del exc_type, exc, tb
+
+        def __aiter__(self) -> _FakeStream:
+            self._items = iter(
+                [
+                    SimpleNamespace(delta=SimpleNamespace(text="hel")),
+                    SimpleNamespace(delta=SimpleNamespace(text="lo")),
+                ]
+            )
+            return self
+
+        async def __anext__(self) -> object:
+            try:
+                return next(self._items)
+            except StopIteration as exc:
+                raise StopAsyncIteration from exc
+
+    class _FakeMessages:
+        def stream(self, **kwargs: object) -> _FakeStream:
+            del kwargs
+            return _FakeStream()
+
+    class _FakeAsyncAnthropic:
+        def __init__(self, *, api_key: str, max_retries: int = 0) -> None:
+            del api_key, max_retries
+            self.messages = _FakeMessages()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=_FakeAsyncAnthropic),
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stream-key")
+
+    provider = AnthropicProvider()
+    chunks = [chunk async for chunk in provider.stream_complete("hello")]
+
+    assert chunks == ["hel", "lo"]
+
+
+@pytest.mark.asyncio
+async def test_stream_complete_retries_retryable_error_before_first_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _RateLimitError(RuntimeError):
+        status_code = 429
+
+    class _FakeStream:
+        async def __aenter__(self) -> _FakeStream:
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            del exc_type, exc, tb
+
+        def __aiter__(self) -> _FakeStream:
+            self._items = iter([SimpleNamespace(delta=SimpleNamespace(text="ok"))])
+            return self
+
+        async def __anext__(self) -> object:
+            try:
+                return next(self._items)
+            except StopIteration as exc:
+                raise StopAsyncIteration from exc
+
+    class _FakeMessages:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def stream(self, **kwargs: object) -> _FakeStream:
+            del kwargs
+            self.calls += 1
+            if self.calls == 1:
+                raise _RateLimitError("rate limited")
+            return _FakeStream()
+
+    messages = _FakeMessages()
+
+    class _FakeAsyncAnthropic:
+        def __init__(self, *, api_key: str, max_retries: int = 0) -> None:
+            del api_key, max_retries
+            self.messages = messages
+
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=_FakeAsyncAnthropic, RateLimitError=_RateLimitError),
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stream-retry-key")
+
+    provider = AnthropicProvider(max_retries=2, retry_initial_backoff_s=0)
+    chunks = [chunk async for chunk in provider.stream_complete("hello")]
+
+    assert chunks == ["ok"]
+    assert messages.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_stream_complete_does_not_retry_after_yielding_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _RateLimitError(RuntimeError):
+        status_code = 429
+
+    class _FakeStream:
+        async def __aenter__(self) -> _FakeStream:
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            del exc_type, exc, tb
+
+        def __aiter__(self) -> _FakeStream:
+            self._sent = False
+            return self
+
+        async def __anext__(self) -> object:
+            if not self._sent:
+                self._sent = True
+                return SimpleNamespace(delta=SimpleNamespace(text="partial"))
+            raise _RateLimitError("late stream failure")
+
+    class _FakeMessages:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def stream(self, **kwargs: object) -> _FakeStream:
+            del kwargs
+            self.calls += 1
+            return _FakeStream()
+
+    messages = _FakeMessages()
+
+    class _FakeAsyncAnthropic:
+        def __init__(self, *, api_key: str, max_retries: int = 0) -> None:
+            del api_key, max_retries
+            self.messages = messages
+
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=_FakeAsyncAnthropic, RateLimitError=_RateLimitError),
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stream-late-failure-key")
+
+    provider = AnthropicProvider(max_retries=2, retry_initial_backoff_s=0)
+    chunks: list[str] = []
+    with pytest.raises(_RateLimitError, match="late stream failure"):
+        async for chunk in provider.stream_complete("hello"):
+            chunks.append(chunk)
+
+    assert chunks == ["partial"]
+    assert messages.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_complete_batch_uses_concurrency_throttle(monkeypatch: pytest.MonkeyPatch) -> None:
+    active = 0
+    max_active = 0
+
+    class _FakeMessages:
+        async def create(self, **kwargs: object) -> object:
+            nonlocal active, max_active
+            del kwargs
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0)
+            active -= 1
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="ok")],
+                usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+            )
+
+    class _FakeAsyncAnthropic:
+        def __init__(self, *, api_key: str, max_retries: int = 0) -> None:
+            del api_key, max_retries
+            self.messages = _FakeMessages()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=_FakeAsyncAnthropic),
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "batch-key")
+
+    provider = AnthropicProvider(max_concurrency=1)
+    responses = await provider.complete_batch(["a", "b", "c"])
+
+    assert [response.content for response in responses] == ["ok", "ok", "ok"]
+    assert max_active == 1
+
+
+@pytest.mark.asyncio
+async def test_create_message_batch_calls_anthropic_batches_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class _FakeBatches:
+        async def create(self, **kwargs: object) -> object:
+            calls.append(kwargs)
+            return {"id": "batch-1"}
+
+    class _FakeMessages:
+        def __init__(self) -> None:
+            self.batches = _FakeBatches()
+
+    class _FakeAsyncAnthropic:
+        def __init__(self, *, api_key: str, max_retries: int = 0) -> None:
+            del api_key, max_retries
+            self.messages = _FakeMessages()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=_FakeAsyncAnthropic),
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "batch-api-key")
+
+    provider = AnthropicProvider()
+    result = await provider.create_message_batch(["a", "b"], system="shared")
+
+    assert result == {"id": "batch-1"}
+    assert [request["custom_id"] for request in calls[0]["requests"]] == ["agora-0", "agora-1"]
+    assert calls[0]["requests"][0]["params"]["system"] == "shared"
+
+
+@pytest.mark.asyncio
+async def test_complete_batch_message_batches_api_polls_and_returns_results_in_prompt_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class _FakeBatches:
+        def __init__(self) -> None:
+            self._statuses = ["in_progress", "ended"]
+
+        async def create(self, **kwargs: object) -> object:
+            calls.append(("create", kwargs))
+            return SimpleNamespace(id="batch-1", processing_status="in_progress")
+
+        async def retrieve(self, batch_id: str) -> object:
+            calls.append(("retrieve", batch_id))
+            return SimpleNamespace(
+                id=batch_id,
+                processing_status=self._statuses.pop(0),
+            )
+
+        async def results(self, batch_id: str) -> list[object]:
+            calls.append(("results", batch_id))
+            return [
+                SimpleNamespace(
+                    custom_id="agora-1",
+                    result=SimpleNamespace(
+                        type="succeeded",
+                        message=_anthropic_message("second", input_tokens=3, output_tokens=4),
+                    ),
+                ),
+                SimpleNamespace(
+                    custom_id="agora-0",
+                    result=SimpleNamespace(
+                        type="succeeded",
+                        message=_anthropic_message("first", input_tokens=1, output_tokens=2),
+                    ),
+                ),
+            ]
+
+    class _FakeMessages:
+        def __init__(self) -> None:
+            self.batches = _FakeBatches()
+
+    class _FakeAsyncAnthropic:
+        def __init__(self, *, api_key: str, max_retries: int = 0) -> None:
+            del api_key, max_retries
+            self.messages = _FakeMessages()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=_FakeAsyncAnthropic),
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "batch-completion-key")
+
+    provider = AnthropicProvider()
+    responses = await provider.complete_batch(
+        ["a", "b"],
+        system="shared",
+        use_message_batches_api=True,
+        message_batch_poll_interval_s=0,
+        message_batch_timeout_s=1,
+    )
+
+    assert [response.content for response in responses] == ["first", "second"]
+    assert [(response.input_tokens, response.output_tokens) for response in responses] == [
+        (1, 2),
+        (3, 4),
+    ]
+    assert [response.metadata["anthropic_custom_id"] for response in responses] == [
+        "agora-0",
+        "agora-1",
+    ]
+    assert [name for name, _payload in calls] == ["create", "retrieve", "retrieve", "results"]
+    create_payload = calls[0][1]
+    assert isinstance(create_payload, dict)
+    assert create_payload["requests"][0]["params"]["system"] == "shared"
+
+
+@pytest.mark.asyncio
+async def test_complete_batch_message_batches_api_raises_for_failed_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeBatches:
+        async def create(self, **kwargs: object) -> object:
+            del kwargs
+            return {"id": "batch-2"}
+
+        async def retrieve(self, batch_id: str) -> object:
+            return {"id": batch_id, "processing_status": "ended"}
+
+        async def results(self, batch_id: str) -> list[object]:
+            del batch_id
+            return [
+                {
+                    "custom_id": "agora-0",
+                    "result": {
+                        "type": "errored",
+                        "error": {
+                            "type": "invalid_request",
+                            "message": "bad prompt",
+                        },
+                    },
+                }
+            ]
+
+    class _FakeMessages:
+        def __init__(self) -> None:
+            self.batches = _FakeBatches()
+
+    class _FakeAsyncAnthropic:
+        def __init__(self, *, api_key: str, max_retries: int = 0) -> None:
+            del api_key, max_retries
+            self.messages = _FakeMessages()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=_FakeAsyncAnthropic),
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "batch-failure-key")
+
+    provider = AnthropicProvider()
+
+    with pytest.raises(RuntimeError, match=r"agora-0.*invalid_request.*bad prompt"):
+        await provider.complete_batch(
+            ["a"],
+            use_message_batches_api=True,
+            message_batch_poll_interval_s=0,
+            message_batch_timeout_s=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_complete_batch_message_batches_api_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeBatches:
+        async def create(self, **kwargs: object) -> object:
+            del kwargs
+            return SimpleNamespace(id="batch-3")
+
+        async def retrieve(self, batch_id: str) -> object:
+            return SimpleNamespace(id=batch_id, processing_status="in_progress")
+
+        async def results(self, batch_id: str) -> list[object]:
+            del batch_id
+            return []
+
+    class _FakeMessages:
+        def __init__(self) -> None:
+            self.batches = _FakeBatches()
+
+    class _FakeAsyncAnthropic:
+        def __init__(self, *, api_key: str, max_retries: int = 0) -> None:
+            del api_key, max_retries
+            self.messages = _FakeMessages()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=_FakeAsyncAnthropic),
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "batch-timeout-key")
+
+    provider = AnthropicProvider()
+
+    with pytest.raises(TimeoutError, match="batch-3"):
+        await provider.complete_batch(
+            ["a"],
+            use_message_batches_api=True,
+            message_batch_poll_interval_s=0,
+            message_batch_timeout_s=0,
         )
 
 

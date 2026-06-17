@@ -12,6 +12,36 @@ if TYPE_CHECKING:
 
 from agora.state import StateBackend, StateValue, StoredValue
 
+from agora_plugins.redis.connection import RedisClusterAddressRemap, build_sync_redis_client
+
+_COMPARE_AND_SET_SCRIPT = """
+local current = redis.call("GET", KEYS[1])
+if not current then
+  return 0
+end
+
+local ok, decoded = pcall(cjson.decode, current)
+if ok then
+  local expires_at = decoded["expires_at"]
+  if expires_at ~= nil and expires_at ~= cjson.null and tonumber(expires_at) <= tonumber(ARGV[4]) then
+    redis.call("DEL", KEYS[1])
+    return 0
+  end
+end
+
+if current ~= ARGV[1] then
+  return 0
+end
+
+local ttl_ms = tonumber(ARGV[3])
+if ttl_ms < 0 then
+  redis.call("SET", KEYS[1], ARGV[2])
+else
+  redis.call("SET", KEYS[1], ARGV[2], "PX", ttl_ms)
+end
+return 1
+"""
+
 
 class RedisBackend(StateBackend):
     """Redis-backed state backend.
@@ -28,17 +58,30 @@ class RedisBackend(StateBackend):
         self,
         url: str = "redis://localhost:6379",
         prefix: str = "agora:state:",
+        *,
+        redis_cluster: bool = False,
+        redis_cluster_address_remap: RedisClusterAddressRemap | None = None,
+        sentinel_service_name: str | None = None,
+        sentinel_urls: list[str] | None = None,
     ) -> None:
         try:
-            import redis
+            __import__("redis")
         except ImportError:
             raise ImportError(
                 "RedisBackend requires 'redis'. "
                 "Install with: pip install 'agora-etl-plugins[redis]'"
             ) from None
 
-        self._redis = redis.Redis.from_url(url, decode_responses=True)
+        self._redis = build_sync_redis_client(
+            url=url,
+            decode_responses=True,
+            redis_cluster=redis_cluster,
+            redis_cluster_address_remap=redis_cluster_address_remap,
+            sentinel_service_name=sentinel_service_name,
+            sentinel_urls=sentinel_urls,
+        )
         self._prefix = prefix
+        self._redis_cluster = redis_cluster
 
     def get(self, key: str) -> StoredValue | None:
         payload = cast("str | None", self._redis.get(self._key(key)))
@@ -52,7 +95,7 @@ class RedisBackend(StateBackend):
         return StoredValue(value=data.get("value"), expires_at=expires_at)
 
     def set(self, key: str, value: StateValue, *, expires_at: float | None = None) -> None:
-        payload = json.dumps({"value": value, "expires_at": expires_at}, ensure_ascii=False)
+        payload = _state_payload(value, expires_at=expires_at)
         redis_key = self._key(key)
         ttl_ms = self._ttl_ms(expires_at)
         if ttl_ms is None:
@@ -70,14 +113,50 @@ class RedisBackend(StateBackend):
         *,
         expires_at: float | None = None,
     ) -> bool:
-        payload = json.dumps({"value": value, "expires_at": expires_at}, ensure_ascii=False)
+        payload = _state_payload(value, expires_at=expires_at)
         redis_key = self._key(key)
         ttl_ms = self._ttl_ms(expires_at)
         if ttl_ms is None:
             return bool(self._redis.set(redis_key, payload, nx=True))
         if ttl_ms <= 0:
-            return self.get(key) is None
+            return False
         return bool(self._redis.set(redis_key, payload, nx=True, px=ttl_ms))
+
+    def compare_and_set(
+        self,
+        key: str,
+        expected: StoredValue | None,
+        value: StateValue,
+        *,
+        expires_at: float | None = None,
+    ) -> bool:
+        """Atomically replace *key* only when its stored value still matches *expected*.
+
+        Pass ``expected=None`` to create the key only if it is absent, matching
+        ``set_if_absent`` semantics. For existing keys, callers should pass the
+        exact ``StoredValue`` returned by ``get()`` so the value and expiry token
+        are both protected against concurrent updates.
+        """
+        if expected is None:
+            return self.set_if_absent(key, value, expires_at=expires_at)
+        ttl_ms = self._ttl_ms(expires_at)
+        if ttl_ms is not None and ttl_ms <= 0:
+            return False
+        redis_key = self._key(key)
+        expected_payload = _state_payload(expected.value, expires_at=expected.expires_at)
+        next_payload = _state_payload(value, expires_at=expires_at)
+        ttl_arg = -1 if ttl_ms is None else ttl_ms
+        return bool(
+            self._redis.eval(
+                _COMPARE_AND_SET_SCRIPT,
+                1,
+                redis_key,
+                expected_payload,
+                next_payload,
+                ttl_arg,
+                time.time(),
+            )
+        )
 
     def delete(self, key: str) -> None:
         self._redis.delete(self._key(key))
@@ -89,6 +168,10 @@ class RedisBackend(StateBackend):
         keys = list(self._scan_prefixed_keys(prefix))
         if not keys:
             return 0
+        if self._redis_cluster:
+            for key in keys:
+                self._redis.delete(key)
+            return len(keys)
         self._redis.delete(*keys)
         return len(keys)
 
@@ -108,6 +191,10 @@ class RedisBackend(StateBackend):
             return None
         remaining_s = expires_at - time.time()
         return math.ceil(remaining_s * 1000)
+
+
+def _state_payload(value: StateValue, *, expires_at: float | None) -> str:
+    return json.dumps({"value": value, "expires_at": expires_at}, ensure_ascii=False)
 
 
 __all__ = ["RedisBackend"]

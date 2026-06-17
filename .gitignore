@@ -3,6 +3,7 @@
 
 # Ignore virtual environment
 .venv/
+.wheel-smoke-venv/
 
 # Ignore .env file
 .env
@@ -26,6 +27,9 @@ htmlcov/
 *.geojson
 *.parquet
 !examples/**/data/*.parquet
+
+# Docker
+.docker/*
 
 # Ignore logs
 *.log

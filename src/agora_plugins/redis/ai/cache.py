@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from agora.ai.cache import LLM_CACHE_DEFAULT_TTL_S, StateBackendLLMCache
 
 from agora_plugins.redis.state import RedisBackend
@@ -24,6 +26,20 @@ class RedisLLMCache(StateBackendLLMCache):
             namespace="llm",
             default_ttl_s=default_ttl_s,
         )
+
+    async def get(self, key: str) -> str | None:
+        value = await asyncio.to_thread(self._store.get, key)
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise TypeError(f"LLM cache entry for {key!r} must be a string, got {type(value)!r}")
+        return value
+
+    async def set(self, key: str, value: str, ttl: int | None = None) -> None:
+        await asyncio.to_thread(self._store.set, key, value, ttl_s=ttl)
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self._store.close)
 
 
 __all__ = ["RedisLLMCache"]

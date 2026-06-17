@@ -1,0 +1,59 @@
+services:
+  postgres-primary:
+    image: soldevelo/postgresql-repmgr:16
+    restart: unless-stopped
+    environment:
+      POSTGRESQL_POSTGRES_PASSWORD: postgres
+      POSTGRESQL_USERNAME: agora
+      POSTGRESQL_PASSWORD: agora
+      POSTGRESQL_DATABASE: agora_test
+      REPMGR_USERNAME: repmgr
+      REPMGR_PASSWORD: repmgrpass
+      REPMGR_PRIMARY_HOST: postgres-primary
+      REPMGR_PARTNER_NODES: postgres-primary,postgres-standby
+      REPMGR_NODE_NAME: postgres-primary-1
+      REPMGR_NODE_ID: 1
+      REPMGR_NODE_NETWORK_NAME: postgres-primary
+      REPMGR_PORT_NUMBER: 5432
+    ports:
+      - "15435:5432"
+    volumes:
+      - postgres_primary_data:/bitnami/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agora -d agora_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  postgres-standby:
+    image: soldevelo/postgresql-repmgr:16
+    restart: unless-stopped
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    environment:
+      POSTGRESQL_POSTGRES_PASSWORD: postgres
+      POSTGRESQL_USERNAME: agora
+      POSTGRESQL_PASSWORD: agora
+      POSTGRESQL_DATABASE: agora_test
+      REPMGR_USERNAME: repmgr
+      REPMGR_PASSWORD: repmgrpass
+      REPMGR_PRIMARY_HOST: postgres-primary
+      REPMGR_PARTNER_NODES: postgres-primary,postgres-standby
+      REPMGR_NODE_NAME: postgres-standby-2
+      REPMGR_NODE_ID: 2
+      REPMGR_NODE_NETWORK_NAME: postgres-standby
+      REPMGR_PORT_NUMBER: 5432
+    ports:
+      - "15436:5432"
+    volumes:
+      - postgres_standby_data:/bitnami/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agora -d agora_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  postgres_primary_data:
+  postgres_standby_data:

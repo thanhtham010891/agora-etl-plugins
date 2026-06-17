@@ -1,0 +1,113 @@
+services:
+  redis-primary:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--protected-mode",
+        "no",
+        "--bind",
+        "0.0.0.0",
+        "--port",
+        "6379",
+      ]
+    ports:
+      - "16381:6379"
+    volumes:
+      - redis_sentinel_primary_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis-replica:
+    image: redis:7-alpine
+    restart: unless-stopped
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--protected-mode",
+        "no",
+        "--bind",
+        "0.0.0.0",
+        "--port",
+        "6379",
+        "--replicaof",
+        "redis-primary",
+        "6379",
+      ]
+    ports:
+      - "16382:6379"
+    volumes:
+      - redis_sentinel_replica_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis-sentinel:
+    image: redis:7-alpine
+    restart: unless-stopped
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+      redis-replica:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        cp /conf/sentinel.conf /tmp/sentinel.conf
+        exec redis-sentinel /tmp/sentinel.conf
+    volumes:
+      - ./docker/redis-sentinel:/conf:ro
+    ports:
+      - "26379:26379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis-master-proxy:
+    image: python:3.11-alpine
+    restart: unless-stopped
+    depends_on:
+      redis-sentinel:
+        condition: service_healthy
+    command: ["python", "/app/redis_sentinel_proxy.py"]
+    environment:
+      REDIS_SENTINEL_HOST: redis-sentinel
+      REDIS_SENTINEL_PORT: "26379"
+      REDIS_SENTINEL_MASTER_NAME: mymaster
+      REDIS_PROXY_HOST: 0.0.0.0
+      REDIS_PROXY_PORT: "6379"
+    volumes:
+      - ./scripts/redis_sentinel_proxy.py:/app/redis_sentinel_proxy.py:ro
+    ports:
+      - "16383:6379"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1', 6379), timeout=2); s.close()",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  redis_sentinel_primary_data:
+  redis_sentinel_replica_data:

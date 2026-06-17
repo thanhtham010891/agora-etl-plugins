@@ -1,35 +1,111 @@
 from __future__ import annotations
 
+import asyncio
+import json
+
 import pytest
 
 from agora_plugins.distributed.coordinator import RedisWorkerCoordinator
 
 
 class _FakeScript:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        result: object = 1,
+        *,
+        delay_s: float = 0.0,
+        redis: _FakeRedis | None = None,
+        kind: str = "",
+    ) -> None:
+        self.calls: list[tuple[list[str], list[str]]] = []
+        self.result = result
+        self.delay_s = delay_s
+        self._redis = redis
+        self._kind = kind
+
+    async def __call__(self, *, keys: list[str], args: list[str]) -> object:
+        if self.delay_s:
+            await asyncio.sleep(self.delay_s)
+        self.calls.append((keys, args))
+        if self._kind == "release" and self._redis is not None:
+            raw = self._redis.worker_payloads.get(keys[0])
+            if _payload_matches(raw, args[0], args[1]):
+                self._redis.worker_payloads.pop(keys[0], None)
+        return self.result
+
+
+class _FakeAcquireScript:
+    def __init__(self, redis: _FakeRedis) -> None:
+        self._redis = redis
+        self.calls: list[tuple[list[str], list[str]]] = []
+
+    async def __call__(self, *, keys: list[str], args: list[str]) -> list[object]:
+        self.calls.append((keys, args))
+        lease_key, fence_key = keys
+        if lease_key in self._redis.worker_payloads:
+            return [0, None]
+        self._redis.counters[fence_key] = self._redis.counters.get(fence_key, 0) + 1
+        token = self._redis.counters[fence_key]
+        self._redis.expire_calls.append((fence_key, int(args[5])))
+        self._redis.worker_payloads[lease_key] = json.dumps(
+            {
+                "worker_id": args[0],
+                "acquired_at": args[1],
+                "pipeline_id": args[2],
+                "run_number": int(args[3]),
+                "fencing_token": token,
+            }
+        )
+        return [1, token]
+
+
+class _FakeRedlockAcquireScript:
+    def __init__(self, redis: _FakeRedis) -> None:
+        self._redis = redis
         self.calls: list[tuple[list[str], list[str]]] = []
 
     async def __call__(self, *, keys: list[str], args: list[str]) -> int:
         self.calls.append((keys, args))
+        lease_key = keys[0]
+        if not self._redis.redlock_acquire or lease_key in self._redis.worker_payloads:
+            return 0
+        self._redis.worker_payloads[lease_key] = args[0]
         return 1
 
 
 class _FakeRedis:
-    def __init__(self, *, ping_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        ping_error: Exception | None = None,
+        script_result: int = 1,
+        redlock_acquire: bool = True,
+    ) -> None:
         self._ping_error = ping_error
         self.set_calls: list[tuple[str, str, bool | None, int | None]] = []
         self.scan_calls = 0
         self.closed = False
-        self.script = _FakeScript()
+        self.redlock_acquire = redlock_acquire
+        self.release_script = _FakeScript(script_result, redis=self, kind="release")
+        self.renew_script = _FakeScript(script_result)
+        self.acquire_script = _FakeAcquireScript(self)
+        self.redlock_acquire_script = _FakeRedlockAcquireScript(self)
         self.worker_payloads: dict[str, str] = {}
+        self.counters: dict[str, int] = {}
+        self.expire_calls: list[tuple[str, int]] = []
 
     async def ping(self) -> None:
         if self._ping_error is not None:
             raise self._ping_error
 
     def register_script(self, script: str) -> _FakeScript:
-        del script
-        return self.script
+        if "REDLOCK_ACQUIRE" in script:
+            return self.redlock_acquire_script  # type: ignore[return-value]
+        if "INCR" in script and "cjson.encode" in script:
+            return self.acquire_script  # type: ignore[return-value]
+        if "EXPIRE" in script:
+            return self.renew_script
+        return self.release_script
 
     async def set(
         self,
@@ -45,6 +121,13 @@ class _FakeRedis:
         self.worker_payloads[key] = value
         return "OK"
 
+    async def incr(self, key: str) -> int:
+        self.counters[key] = self.counters.get(key, 0) + 1
+        return self.counters[key]
+
+    async def expire(self, key: str, ttl: int) -> None:
+        self.expire_calls.append((key, ttl))
+
     async def scan(
         self,
         cursor: int,
@@ -58,6 +141,9 @@ class _FakeRedis:
 
     async def mget(self, *keys: str) -> list[str | None]:
         return [self.worker_payloads.get(key) for key in keys]
+
+    async def get(self, key: str) -> str | None:
+        return self.worker_payloads.get(key)
 
     async def delete(self, key: str) -> None:
         self.worker_payloads.pop(key, None)
@@ -76,6 +162,37 @@ def _install_fake_aioredis(monkeypatch: pytest.MonkeyPatch, redis: _FakeRedis) -
     monkeypatch.setattr(
         "agora_plugins.distributed.coordinator.aioredis",
         _Factory,
+    )
+
+
+def _install_fake_aioredis_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_nodes: list[_FakeRedis],
+) -> None:
+    calls: list[str] = []
+
+    class _Factory:
+        @staticmethod
+        def from_url(url: str, *, decode_responses: bool):
+            del decode_responses
+            calls.append(url)
+            return redis_nodes[len(calls) - 1]
+
+    monkeypatch.setattr(
+        "agora_plugins.distributed.coordinator.aioredis",
+        _Factory,
+    )
+
+
+def _payload_matches(raw: str | None, worker_id: str, fencing_token: str) -> bool:
+    if raw is None:
+        return False
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return False
+    return data.get("worker_id") == worker_id and str(data.get("fencing_token")) == str(
+        fencing_token
     )
 
 
@@ -128,6 +245,266 @@ async def test_coordinator_releases_lease_for_current_worker(
 
     await coordinator.release_lease("pipe-a")
 
-    assert redis.script.calls == [(["agora:distributed:lease:pipe-a"], ["worker-a"])]
+    assert redis.release_script.calls == [(["agora:distributed:lease:pipe-a"], ["worker-a", "1"])]
+
+    await coordinator.stop()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_does_not_release_without_local_fencing_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = _FakeRedis()
+    _install_fake_aioredis(monkeypatch, redis)
+
+    coordinator = RedisWorkerCoordinator()
+    await coordinator.start("worker-a", ["pipe-a"])
+
+    await coordinator.release_lease("pipe-a")
+
+    assert redis.release_script.calls == []
+
+    await coordinator.stop()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_exposes_and_renews_fencing_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = _FakeRedis()
+    _install_fake_aioredis(monkeypatch, redis)
+
+    coordinator = RedisWorkerCoordinator()
+    await coordinator.start("worker-a", ["pipe-a"])
+
+    assert await coordinator.try_acquire_lease("pipe-a", 42) is True
+    lease = coordinator.current_lease("pipe-a")
+
+    assert lease is not None
+    assert lease.fencing_token == 1
+    assert redis.acquire_script.calls[-1][0] == [
+        "agora:distributed:lease:pipe-a",
+        "agora:distributed:fence:pipe-a",
+    ]
+    assert redis.expire_calls == [("agora:distributed:fence:pipe-a", 30 * 24 * 60 * 60)]
+    assert await coordinator.renew_lease("pipe-a") is True
+    assert redis.renew_script.calls[-1] == (
+        ["agora:distributed:lease:pipe-a"],
+        ["worker-a", "1", "300"],
+    )
+    assert redis.expire_calls == [("agora:distributed:fence:pipe-a", 30 * 24 * 60 * 60)]
+
+    await coordinator.stop()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_deduplicates_scan_results_when_listing_workers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = _FakeRedis()
+    _install_fake_aioredis(monkeypatch, redis)
+
+    coordinator = RedisWorkerCoordinator()
+    await coordinator.start("worker-a", ["pipe-a"])
+    worker_key = "agora:distributed:workers:worker-a"
+
+    async def _duplicate_scan(
+        cursor: int,
+        *,
+        match: str,
+        count: int,
+    ) -> tuple[int, list[str]]:
+        del match, count
+        if cursor == 0:
+            return 1, [worker_key, worker_key]
+        return 0, [worker_key]
+
+    redis.scan = _duplicate_scan  # type: ignore[method-assign]
+
+    workers = await coordinator.list_workers()
+
+    assert len(workers) == 1
+    assert workers[0].worker_id == "worker-a"
+
+    await coordinator.stop()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_fires_lease_lost_callback_on_takeover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = _FakeRedis(script_result=0)
+    _install_fake_aioredis(monkeypatch, redis)
+
+    coordinator = RedisWorkerCoordinator()
+    lost: list[str] = []
+
+    async def _on_lost(pipeline_id: str) -> None:
+        lost.append(pipeline_id)
+
+    coordinator.set_lease_lost_callback(_on_lost)
+    await coordinator.start("worker-a", ["pipe-a"])
+
+    assert await coordinator.try_acquire_lease("pipe-a", 1) is True
+    assert await coordinator.renew_lease("pipe-a") is False
+    assert lost == ["pipe-a"]
+    assert coordinator.current_lease("pipe-a") is None
+
+    await coordinator.stop()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_marks_leases_lost_when_renew_cycle_exceeds_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = _FakeRedis()
+    redis.renew_script.delay_s = 0.05
+    _install_fake_aioredis(monkeypatch, redis)
+
+    coordinator = RedisWorkerCoordinator(
+        lease_ttl_seconds=3,
+        heartbeat_interval=1,
+        lease_renewal_deadline_seconds=0.001,
+    )
+    lost: list[str] = []
+
+    async def _on_lost(pipeline_id: str) -> None:
+        lost.append(pipeline_id)
+
+    coordinator.set_lease_lost_callback(_on_lost)
+    await coordinator.start("worker-a", ["pipe-a"])
+
+    assert await coordinator.try_acquire_lease("pipe-a", 1) is True
+    assert coordinator.current_lease("pipe-a") is not None
+
+    await coordinator._renew_leases_once()
+
+    assert coordinator.current_lease("pipe-a") is None
+    assert lost == ["pipe-a"]
+
+    await coordinator.stop()
+
+
+def test_coordinator_rejects_invalid_renew_cycle_deadline() -> None:
+    with pytest.raises(ValueError, match="lease_renewal_deadline_seconds"):
+        RedisWorkerCoordinator(lease_renewal_deadline_seconds=0)
+
+
+def test_coordinator_rejects_invalid_timing_values() -> None:
+    with pytest.raises(ValueError, match="lease_ttl_seconds"):
+        RedisWorkerCoordinator(lease_ttl_seconds=0)
+
+    with pytest.raises(ValueError, match="heartbeat_interval"):
+        RedisWorkerCoordinator(heartbeat_interval=0)
+
+    with pytest.raises(ValueError, match="fencing_key_ttl_seconds"):
+        RedisWorkerCoordinator(fencing_key_ttl_seconds=0)
+
+
+def test_coordinator_rejects_too_few_redlock_urls() -> None:
+    with pytest.raises(ValueError, match="at least 3"):
+        RedisWorkerCoordinator(redlock_redis_urls=["redis://r1", "redis://r2"])
+
+
+@pytest.mark.asyncio
+async def test_coordinator_does_not_increment_fencing_token_when_lease_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = _FakeRedis()
+    _install_fake_aioredis(monkeypatch, redis)
+
+    first = RedisWorkerCoordinator()
+    await first.start("worker-a", ["pipe-a"])
+    assert await first.try_acquire_lease("pipe-a", 1) is True
+
+    second = RedisWorkerCoordinator()
+    await second.start("worker-b", ["pipe-a"])
+    assert await second.try_acquire_lease("pipe-a", 2) is False
+
+    assert redis.counters["agora:distributed:fence:pipe-a"] == 1
+
+    await first.stop()
+    await second.stop()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_redlock_acquires_validates_and_releases_quorum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = _FakeRedis()
+    nodes = [_FakeRedis(), _FakeRedis(), _FakeRedis()]
+    _install_fake_aioredis_sequence(monkeypatch, [primary, *nodes])
+
+    coordinator = RedisWorkerCoordinator(
+        redlock_redis_urls=["redis://r1", "redis://r2", "redis://r3"]
+    )
+    await coordinator.start("worker-a", ["pipe-a"])
+
+    assert await coordinator.try_acquire_lease("pipe-a", 42) is True
+    lease = coordinator.current_lease("pipe-a")
+
+    assert lease is not None
+    assert lease.fencing_token == 1
+    assert primary.counters["agora:distributed:fence:pipe-a"] == 1
+    assert primary.expire_calls == [("agora:distributed:fence:pipe-a", 30 * 24 * 60 * 60)]
+    assert await coordinator.validate_lease("pipe-a", 1) is True
+    assert all("agora:distributed:lease:pipe-a" in node.worker_payloads for node in nodes)
+
+    await coordinator.release_lease("pipe-a")
+
+    assert coordinator.current_lease("pipe-a") is None
+    assert all("agora:distributed:lease:pipe-a" not in node.worker_payloads for node in nodes)
+
+    await coordinator.stop()
+    assert primary.closed is True
+    assert all(node.closed for node in nodes)
+
+
+@pytest.mark.asyncio
+async def test_coordinator_redlock_requires_quorum_and_releases_partial_acquire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = _FakeRedis()
+    nodes = [_FakeRedis(), _FakeRedis(redlock_acquire=False), _FakeRedis(redlock_acquire=False)]
+    _install_fake_aioredis_sequence(monkeypatch, [primary, *nodes])
+
+    coordinator = RedisWorkerCoordinator(
+        redlock_redis_urls=["redis://r1", "redis://r2", "redis://r3"]
+    )
+    await coordinator.start("worker-a", ["pipe-a"])
+
+    assert await coordinator.try_acquire_lease("pipe-a", 1) is False
+    assert coordinator.current_lease("pipe-a") is None
+    assert "agora:distributed:lease:pipe-a" not in nodes[0].worker_payloads
+
+    await coordinator.stop()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_redlock_marks_lease_lost_when_renew_quorum_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = _FakeRedis()
+    nodes = [_FakeRedis(), _FakeRedis(), _FakeRedis()]
+    _install_fake_aioredis_sequence(monkeypatch, [primary, *nodes])
+
+    coordinator = RedisWorkerCoordinator(
+        redlock_redis_urls=["redis://r1", "redis://r2", "redis://r3"]
+    )
+    lost: list[str] = []
+
+    async def _on_lost(pipeline_id: str) -> None:
+        lost.append(pipeline_id)
+
+    coordinator.set_lease_lost_callback(_on_lost)
+    await coordinator.start("worker-a", ["pipe-a"])
+
+    assert await coordinator.try_acquire_lease("pipe-a", 1) is True
+    nodes[1].renew_script.result = 0
+    nodes[2].renew_script.result = 0
+
+    assert await coordinator.renew_lease("pipe-a") is False
+    assert coordinator.current_lease("pipe-a") is None
+    assert lost == ["pipe-a"]
 
     await coordinator.stop()

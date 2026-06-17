@@ -1,0 +1,47 @@
+services:
+  redis-redlock-1:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--protected-mode", "no"]
+    ports:
+      - "16389:6379"
+    volumes:
+      - redis_redlock_1_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis-redlock-2:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--protected-mode", "no"]
+    ports:
+      - "16390:6379"
+    volumes:
+      - redis_redlock_2_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis-redlock-3:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--protected-mode", "no"]
+    ports:
+      - "16391:6379"
+    volumes:
+      - redis_redlock_3_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  redis_redlock_1_data:
+  redis_redlock_2_data:
+  redis_redlock_3_data:

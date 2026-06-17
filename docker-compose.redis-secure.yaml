@@ -1,0 +1,27 @@
+services:
+  redis-secure:
+    image: redis:7-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_SECURE_PASSWORD: ${REDIS_SECURE_PASSWORD:-agora-redis-secret}
+    command:
+      [
+        "redis-server",
+        "/etc/redis/secure/redis.conf",
+        "--aclfile",
+        "/etc/redis/secure/users.acl",
+      ]
+    volumes:
+      - ./.docker/redis-secure:/etc/redis/secure:ro
+    ports:
+      - "16384:6379"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli --tls --cacert /etc/redis/secure/ca.crt -u rediss://agora:$$REDIS_SECURE_PASSWORD@127.0.0.1:6379 ping >/dev/null 2>&1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+

@@ -20,6 +20,8 @@ def test_redis_root_import_is_lazy() -> None:
     assert "agora_plugins.redis.ai" not in sys.modules
     assert "agora_plugins.redis.dedup.stores" not in sys.modules
 
+    assert package.KafkaRedisRuntime.__name__ == "KafkaRedisRuntime"
+    assert package.KafkaRedisStorageConfig.__name__ == "KafkaRedisStorageConfig"
     assert package.RedisLLMCache.__name__ == "RedisLLMCache"
     assert package.RedisStore.__name__ == "RedisStore"
 

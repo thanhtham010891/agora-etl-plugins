@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 
-from agora.core.registry import AGORA_PLUGIN_MANIFEST_VERSION
+from agora.core.registry import AGORA_CORE_API_COMPATIBILITY, AGORA_PLUGIN_MANIFEST_VERSION
 
 
 @dataclass(frozen=True)
@@ -16,6 +16,7 @@ class PluginManifest:
     name: str
     version: str
     agora_api_version: str
+    agora_core_api_range: str
     package: str
     capabilities: tuple[str, ...]
 
@@ -31,6 +32,7 @@ MANIFEST = PluginManifest(
     name="postgres",
     version=_package_version(),
     agora_api_version=AGORA_PLUGIN_MANIFEST_VERSION,
+    agora_core_api_range=AGORA_CORE_API_COMPATIBILITY,
     package="agora-etl-plugins",
     capabilities=(
         "source:postgres",

@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.4.0 (June 17, 2026)
+
+- Moved `agora-etl-plugins` onto the `agora-etl 0.4.x` compatibility line with
+  a floor of `agora-etl>=0.4.1,<1`
+- Added first-class Kafka, PostgreSQL, and Redis connection security settings,
+  secret-file/env resolution, and fail-closed validation for unsupported
+  combinations
+- Added Kafka Schema Registry support for Avro, JSON Schema, and Protobuf,
+  transactional delivery hooks, source health/metrics, tracing, poison-record
+  policies, and Kafka-backed DLQ replay
+- Added PostgreSQL pooled writes, SQL/COPY/COPY-merge modes, target-schema
+  safety policies, HA/replica routing controls, schema-apply locking,
+  observability, and SQL-backed DLQ replay
+- Added Redis Sentinel, Cluster, TLS/ACL, Redis Stack, and quorum coordination
+  support together with stream reclaim/fairness and state atomicity controls
+- Added backend-real release gates for Kafka failover/replay, PostgreSQL HA,
+  Redis deployment topologies, secure transports, and cross-backend delivery
+  wedges
+- Added installed-wheel contract tests that verify package metadata, optional
+  extras, public imports, and plugin entry points outside the source tree
+- Removed the redundant plugin-side `pytest-cov` development constraint so the
+  `dev` extra resolves consistently with the `agora-etl 0.4.1` toolchain
+- Split Kafka source models, poison routing, rebalance helpers, and offset
+  normalization into focused internal modules while preserving public imports
+- Split PostgreSQL identifier safety, metric snapshots, connection pooling,
+  SQL write planning, and write strategies into focused internal modules while
+  preserving public imports
+- Replaced placeholder package metadata URLs with real public GitHub package
+  and docs links
+- Rewrote the package README to reflect the current official bundle story
+  instead of the old `0.3.3` compatibility era
+- Added a first-class local integration workflow with `make integration-up`,
+  `make integration-ps`, `make test-integration`, and `make integration-down`
+- Fixed integration-suite expectations so Redis and PostgreSQL DLQ behavior is
+  validated against current core semantics
+
 ## 0.3.2 (June 12, 2026)
 
 - Promoted Anthropic support into the official `agora-etl-plugins` bundle through the `anthropic` extra
