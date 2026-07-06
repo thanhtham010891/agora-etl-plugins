@@ -8,7 +8,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlencode, urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import pytest
 
@@ -16,6 +16,7 @@ from agora_plugins.kafka import KafkaPluginConfig
 
 _FAIL_ON_INTEGRATION_SKIP_ENV = "AGORA_FAIL_ON_INTEGRATION_SKIP"
 _RELEASE_GATE_SKIP_REPORTS: list[str] = []
+_POSTGRES_CONNECT_TIMEOUT_S = 2
 
 
 def _fail_on_integration_skip_enabled() -> bool:
@@ -208,13 +209,21 @@ def _redis_redlock_docker_compose_file() -> Path:
     )
 
 
-def _run_docker_compose(*args: str, compose_file: Path | None = None) -> None:
+def _run_docker_compose(
+    *args: str,
+    compose_file: Path | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> None:
     compose_file = compose_file or _docker_compose_file()
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
     completed = subprocess.run(
         ["docker", "compose", "-f", str(compose_file), *args],
         check=False,
         capture_output=True,
         text=True,
+        env=env,
     )
     if completed.returncode != 0:
         raise RuntimeError(
@@ -223,13 +232,21 @@ def _run_docker_compose(*args: str, compose_file: Path | None = None) -> None:
         )
 
 
-def _run_docker_compose_output(*args: str, compose_file: Path | None = None) -> str:
+def _run_docker_compose_output(
+    *args: str,
+    compose_file: Path | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> str:
     compose_file = compose_file or _docker_compose_file()
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
     completed = subprocess.run(
         ["docker", "compose", "-f", str(compose_file), *args],
         check=False,
         capture_output=True,
         text=True,
+        env=env,
     )
     if completed.returncode != 0:
         raise RuntimeError(
@@ -329,21 +346,35 @@ def _postgres_is_primary(dsn: str) -> bool:
     return bool(row[0]) if row else False
 
 
+def _dsn_with_query_params(dsn: str, /, **params: str | int) -> str:
+    parsed = urlparse(dsn)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query.update({key: str(value) for key, value in params.items()})
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
 def _wait_for_postgres_dsn(
     dsn: str,
     *,
     timeout_s: float = 60.0,
     require_primary: bool | None = None,
+    stable_polls: int = 1,
 ) -> None:
     deadline = time.monotonic() + timeout_s
     last_error: Exception | None = None
+    stable_matches = 0
     while time.monotonic() < deadline:
         try:
             is_primary = _postgres_is_primary(dsn)
             if require_primary is None or is_primary is require_primary:
-                return
+                stable_matches += 1
+                if stable_matches >= max(stable_polls, 1):
+                    return
+            else:
+                stable_matches = 0
         except Exception as exc:  # pragma: no cover - best effort poller
             last_error = exc
+            stable_matches = 0
         time.sleep(0.5)
     raise RuntimeError(f"Postgres endpoint {dsn} did not become ready: {last_error}")
 
@@ -412,26 +443,54 @@ class PostgresHaControl:
 
     def node_dsn(self, node_name: str) -> str:
         node = self.nodes[node_name]
-        return (
-            f"postgresql://{self.username}:{self.password}@{node.host}:{node.port}/{self.database}"
+        return _dsn_with_query_params(
+            f"postgresql://{self.username}:{self.password}@{node.host}:{node.port}/{self.database}",
+            connect_timeout=_POSTGRES_CONNECT_TIMEOUT_S,
         )
 
     def admin_node_dsn(self, node_name: str) -> str:
         node = self.nodes[node_name]
-        return f"postgresql://postgres:postgres@{node.host}:{node.port}/postgres"
+        return _dsn_with_query_params(
+            f"postgresql://postgres:postgres@{node.host}:{node.port}/postgres",
+            connect_timeout=_POSTGRES_CONNECT_TIMEOUT_S,
+        )
 
     def stop_node(self, node_name: str) -> None:
         node = self.nodes[node_name]
         _stop_local_broker(compose_file=self.compose_file, service=node.service)
 
-    def _start_node_service(self, node_name: str) -> None:
-        node = self.nodes[node_name]
-        _run_docker_compose("up", "-d", node.service, compose_file=self.compose_file)
+    def _repmgr_primary_host_env(self, node_name: str, primary_host: str | None) -> dict[str, str]:
+        if primary_host is None:
+            return {}
+        if node_name == "postgres-primary":
+            return {"AGORA_TEST_POSTGRES_PRIMARY_HOST": primary_host}
+        if node_name == "postgres-standby":
+            return {"AGORA_TEST_POSTGRES_STANDBY_PRIMARY_HOST": primary_host}
+        return {}
 
-    def _recreate_node_service(self, node_name: str) -> None:
+    def _start_node_service(self, node_name: str, *, primary_host: str | None = None) -> None:
+        node = self.nodes[node_name]
+        _run_docker_compose(
+            "up",
+            "-d",
+            "--no-deps",
+            node.service,
+            compose_file=self.compose_file,
+            extra_env=self._repmgr_primary_host_env(node_name, primary_host),
+        )
+
+    def _recreate_node_service(self, node_name: str, *, primary_host: str | None = None) -> None:
         node = self.nodes[node_name]
         _run_docker_compose("rm", "-f", "-s", "-v", node.service, compose_file=self.compose_file)
-        _run_docker_compose("up", "-d", "--wait", node.service, compose_file=self.compose_file)
+        _run_docker_compose(
+            "up",
+            "-d",
+            "--wait",
+            "--no-deps",
+            node.service,
+            compose_file=self.compose_file,
+            extra_env=self._repmgr_primary_host_env(node_name, primary_host),
+        )
 
     def start_node(self, node_name: str) -> None:
         node = self.nodes[node_name]
@@ -453,15 +512,29 @@ class PostgresHaControl:
         *,
         primary: bool,
         timeout_s: float = 60.0,
+        stable_polls: int = 1,
     ) -> None:
         _wait_for_postgres_dsn(
             self.node_dsn(node_name),
             timeout_s=timeout_s,
             require_primary=primary,
+            stable_polls=stable_polls,
         )
 
-    def wait_for_client_route_ready(self, *, timeout_s: float = 60.0) -> None:
-        _wait_for_postgres_dsn(self.dsn, timeout_s=timeout_s)
+    def wait_for_client_route_ready(
+        self,
+        *,
+        timeout_s: float = 60.0,
+        stable_polls: int = 1,
+    ) -> None:
+        _wait_for_postgres_dsn(
+            _dsn_with_query_params(
+                self.dsn,
+                connect_timeout=_POSTGRES_CONNECT_TIMEOUT_S,
+            ),
+            timeout_s=timeout_s,
+            stable_polls=stable_polls,
+        )
 
     def current_primary(self, *, timeout_s: float = 60.0) -> str:
         deadline = time.monotonic() + timeout_s
@@ -617,7 +690,17 @@ class PostgresHaControl:
         if promoted is None:
             raise RuntimeError(f"Postgres standby was not promoted after failover: {last_error}")
 
-        self.wait_for_client_route_ready(timeout_s=timeout_s)
+        remaining_timeout = self._remaining_timeout(deadline)
+        self.wait_for_node_role(
+            promoted,
+            primary=True,
+            timeout_s=remaining_timeout,
+            stable_polls=6,
+        )
+        self.wait_for_client_route_ready(
+            timeout_s=self._remaining_timeout(deadline),
+            stable_polls=3,
+        )
         return primary, promoted
 
     def failover_cycle(
@@ -629,19 +712,41 @@ class PostgresHaControl:
         failed_primary, promoted_primary = self.failover_primary(timeout_s=timeout_s)
         deadline = time.monotonic() + timeout_s
         rejoin_node = failed_primary
-        self._recreate_node_service(rejoin_node)
-        self.wait_for_node_role(
-            rejoin_node,
-            primary=False,
-            timeout_s=self._remaining_timeout(deadline),
+        last_error: RuntimeError | None = None
+        while time.monotonic() < deadline:
+            self._recreate_node_service(rejoin_node, primary_host=promoted_primary)
+            try:
+                self.wait_for_node_role(
+                    promoted_primary,
+                    primary=True,
+                    timeout_s=self._remaining_timeout(deadline),
+                    stable_polls=4,
+                )
+                self.wait_for_node_role(
+                    rejoin_node,
+                    primary=False,
+                    timeout_s=self._remaining_timeout(deadline),
+                    stable_polls=4,
+                )
+                self.wait_for_replication_ready(
+                    promoted_primary,
+                    rejoin_node,
+                    timeout_s=self._remaining_timeout(deadline),
+                )
+                self.wait_for_client_route_ready(
+                    timeout_s=self._remaining_timeout(deadline),
+                    stable_polls=3,
+                )
+                return failed_primary, promoted_primary
+            except RuntimeError as exc:
+                last_error = exc
+                if self._remaining_timeout(deadline) <= 1.0:
+                    break
+                time.sleep(1.0)
+
+        raise RuntimeError(
+            f"Postgres failover cycle did not rejoin the previous primary as standby: {last_error}"
         )
-        self.wait_for_replication_ready(
-            promoted_primary,
-            rejoin_node,
-            timeout_s=self._remaining_timeout(deadline),
-        )
-        self.wait_for_client_route_ready(timeout_s=self._remaining_timeout(deadline))
-        return failed_primary, promoted_primary
 
     def failover_loop(self, *, cycles: int, timeout_s: float = 120.0) -> list[tuple[str, str]]:
         transitions: list[tuple[str, str]] = []

@@ -2,82 +2,34 @@
 
 from __future__ import annotations
 
-import os
 import ssl
-from pathlib import Path
 from typing import Annotated, Any
 
 from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-_SECURITY_PROTOCOLS = frozenset({"PLAINTEXT", "SSL", "SASL_PLAINTEXT", "SASL_SSL"})
-_SASL_PROTOCOLS = frozenset({"SASL_PLAINTEXT", "SASL_SSL"})
-_SSL_PROTOCOLS = frozenset({"SSL", "SASL_SSL"})
-_PASSWORD_SASL_MECHANISMS = frozenset({"PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"})
-_OAUTH_SASL_MECHANISMS = frozenset({"OAUTHBEARER"})
-_KERBEROS_SASL_MECHANISMS = frozenset({"GSSAPI"})
-_SASL_MECHANISMS = _PASSWORD_SASL_MECHANISMS | _OAUTH_SASL_MECHANISMS | _KERBEROS_SASL_MECHANISMS
-_SCHEMA_REGISTRY_TRANSPORTS = frozenset({"stdlib", "pooled"})
-
-
-def _resolve_env_value(env_name: str) -> str:
-    value = os.getenv(env_name)
-    if value is None or value == "":
-        raise ValueError(f"Kafka config env var {env_name!r} is not set or empty.")
-    return value
-
-
-def _resolve_file_value(path: str) -> str:
-    try:
-        value = Path(path).read_text(encoding="utf-8")
-    except OSError as exc:
-        raise ValueError(f"Kafka config secret file {path!r} could not be read: {exc}") from exc
-    value = value.strip()
-    if not value:
-        raise ValueError(f"Kafka config secret file {path!r} is empty.")
-    return value
-
-
-def _resolve_string_value(
-    *,
-    field_name: str,
-    direct: str | None,
-    env_name: str | None = None,
-    file_path: str | None = None,
-) -> str | None:
-    configured_sources = sum(1 for value in (direct, env_name, file_path) if value is not None)
-    if configured_sources > 1:
-        raise ValueError(
-            f"Kafka config field {field_name!r} accepts only one of direct value, *_env, or *_file."
-        )
-    if direct is not None:
-        return direct
-    if env_name is not None:
-        return _resolve_env_value(env_name)
-    if file_path is not None:
-        return _resolve_file_value(file_path)
-    return None
-
-
-def _resolve_secret_value(
-    *,
-    field_name: str,
-    direct: SecretStr | None,
-    env_name: str | None = None,
-    file_path: str | None = None,
-) -> SecretStr | None:
-    configured_sources = sum(1 for value in (direct, env_name, file_path) if value is not None)
-    if configured_sources > 1:
-        raise ValueError(
-            f"Kafka config field {field_name!r} accepts only one of direct value, *_env, or *_file."
-        )
-    if direct is not None:
-        return direct
-    if env_name is not None:
-        return SecretStr(_resolve_env_value(env_name))
-    if file_path is not None:
-        return SecretStr(_resolve_file_value(file_path))
-    return None
+from agora_plugins.kafka._config_constants import (
+    KERBEROS_SASL_MECHANISMS as _KERBEROS_SASL_MECHANISMS,
+)
+from agora_plugins.kafka._config_constants import (
+    OAUTH_SASL_MECHANISMS as _OAUTH_SASL_MECHANISMS,
+)
+from agora_plugins.kafka._config_constants import (
+    PASSWORD_SASL_MECHANISMS as _PASSWORD_SASL_MECHANISMS,
+)
+from agora_plugins.kafka._config_constants import (
+    SASL_MECHANISMS as _SASL_MECHANISMS,
+)
+from agora_plugins.kafka._config_constants import (
+    SASL_PROTOCOLS as _SASL_PROTOCOLS,
+)
+from agora_plugins.kafka._config_constants import (
+    SECURITY_PROTOCOLS as _SECURITY_PROTOCOLS,
+)
+from agora_plugins.kafka._config_constants import (
+    SSL_PROTOCOLS as _SSL_PROTOCOLS,
+)
+from agora_plugins.kafka._config_surface import KafkaConfigSurfaceMixin
 
 
 class KafkaTLSConfig(BaseModel):
@@ -247,7 +199,7 @@ class KafkaSecurityConfig(BaseModel):
         return self.to_aiokafka_client_kwargs()
 
 
-class KafkaConfig(BaseSettings):
+class KafkaConfig(KafkaConfigSurfaceMixin, BaseSettings):
     """Kafka producer/consumer configuration."""
 
     model_config = SettingsConfigDict(
@@ -312,182 +264,8 @@ class KafkaConfig(BaseSettings):
     def topic(self, name: str) -> str:
         return f"{self.env}.{name}"
 
-    def security(self) -> KafkaSecurityConfig | None:
-        sasl_username = _resolve_string_value(
-            field_name="sasl_username",
-            direct=self.sasl_username,
-            env_name=self.sasl_username_env,
-        )
-        sasl_password = _resolve_secret_value(
-            field_name="sasl_password",
-            direct=self.sasl_password,
-            env_name=self.sasl_password_env,
-            file_path=self.sasl_password_file,
-        )
-        ssl_cafile = _resolve_string_value(
-            field_name="ssl_cafile",
-            direct=self.ssl_cafile,
-            env_name=self.ssl_cafile_env,
-        )
-        ssl_certfile = _resolve_string_value(
-            field_name="ssl_certfile",
-            direct=self.ssl_certfile,
-            env_name=self.ssl_certfile_env,
-        )
-        ssl_keyfile = _resolve_string_value(
-            field_name="ssl_keyfile",
-            direct=self.ssl_keyfile,
-            env_name=self.ssl_keyfile_env,
-        )
-        ssl_password = _resolve_secret_value(
-            field_name="ssl_password",
-            direct=self.ssl_password,
-            env_name=self.ssl_password_env,
-            file_path=self.ssl_password_file,
-        )
-        has_tls = any(
-            value is not None for value in (ssl_cafile, ssl_certfile, ssl_keyfile, ssl_password)
-        )
-        has_sasl = any(
-            value is not None
-            for value in (
-                self.sasl_mechanism,
-                sasl_username,
-                sasl_password,
-                self.sasl_kerberos_service_name,
-                self.sasl_kerberos_domain_name,
-            )
-        )
-        if self.security_protocol == "PLAINTEXT" and not has_tls and not has_sasl:
-            return None
 
-        sasl = None
-        if has_sasl:
-            if self.sasl_mechanism is None:
-                raise ValueError("Kafka SASL configuration requires sasl_mechanism.")
-            if self.sasl_mechanism in _OAUTH_SASL_MECHANISMS:
-                raise ValueError(
-                    "Kafka OAUTHBEARER SASL requires an oauth_token_provider object. "
-                    "Pass KafkaSecurityConfig(..., sasl=KafkaSASLConfig(...)) instead "
-                    "of env-style KafkaConfig fields."
-                )
-            if self.sasl_mechanism in _PASSWORD_SASL_MECHANISMS and (
-                sasl_username is None or sasl_password is None
-            ):
-                raise ValueError(
-                    "Kafka SASL configuration requires sasl_mechanism, sasl_username, and sasl_password."
-                )
-            sasl = KafkaSASLConfig(
-                mechanism=self.sasl_mechanism,
-                username=sasl_username,
-                password=sasl_password,
-                kerberos_service_name=self.sasl_kerberos_service_name,
-                kerberos_domain_name=self.sasl_kerberos_domain_name,
-            )
-
-        tls = None
-        if has_tls or self.security_protocol in _SSL_PROTOCOLS:
-            tls = KafkaTLSConfig(
-                cafile=ssl_cafile,
-                certfile=ssl_certfile,
-                keyfile=ssl_keyfile,
-                password=ssl_password,
-                check_hostname=self.ssl_check_hostname,
-            )
-
-        return KafkaSecurityConfig(
-            security_protocol=self.security_protocol,
-            sasl=sasl,
-            tls=tls,
-        )
-
-    def schema_registry_auth(self) -> tuple[str | None, str | None]:
-        username = _resolve_string_value(
-            field_name="schema_registry_username",
-            direct=self.schema_registry_username,
-            env_name=self.schema_registry_username_env,
-        )
-        password = _resolve_string_value(
-            field_name="schema_registry_password",
-            direct=self.schema_registry_password,
-            env_name=self.schema_registry_password_env,
-            file_path=self.schema_registry_password_file,
-        )
-        return username, password
-
-    def schema_registry_tls(self) -> KafkaTLSConfig | None:
-        cafile = _resolve_string_value(
-            field_name="schema_registry_ssl_cafile",
-            direct=self.schema_registry_ssl_cafile,
-            env_name=self.schema_registry_ssl_cafile_env,
-        )
-        certfile = _resolve_string_value(
-            field_name="schema_registry_ssl_certfile",
-            direct=self.schema_registry_ssl_certfile,
-            env_name=self.schema_registry_ssl_certfile_env,
-        )
-        keyfile = _resolve_string_value(
-            field_name="schema_registry_ssl_keyfile",
-            direct=self.schema_registry_ssl_keyfile,
-            env_name=self.schema_registry_ssl_keyfile_env,
-        )
-        password = _resolve_secret_value(
-            field_name="schema_registry_ssl_password",
-            direct=self.schema_registry_ssl_password,
-            env_name=self.schema_registry_ssl_password_env,
-            file_path=self.schema_registry_ssl_password_file,
-        )
-        if (
-            all(value is None for value in (cafile, certfile, keyfile, password))
-            and self.schema_registry_ssl_check_hostname
-        ):
-            return None
-        return KafkaTLSConfig(
-            cafile=cafile,
-            certfile=certfile,
-            keyfile=keyfile,
-            password=password,
-            check_hostname=self.schema_registry_ssl_check_hostname,
-        )
-
-    def schema_registry_client(
-        self,
-        *,
-        headers: dict[str, str] | None = None,
-    ) -> Any:
-        if self.schema_registry_url is None:
-            raise ValueError("schema_registry_url must be configured to build a registry client.")
-        username, password = self.schema_registry_auth()
-        if (username is None) != (password is None):
-            raise ValueError("Schema registry auth requires both username and password together.")
-        if self.schema_registry_transport not in _SCHEMA_REGISTRY_TRANSPORTS:
-            supported = ", ".join(sorted(_SCHEMA_REGISTRY_TRANSPORTS))
-            raise ValueError(
-                f"Unsupported schema_registry_transport {self.schema_registry_transport!r}. "
-                f"Supported: {supported}"
-            )
-        from agora_plugins.kafka.schema_registry import (
-            ConfluentSchemaRegistryClient,
-            PooledConfluentSchemaRegistryClient,
-        )
-
-        client_cls: type[Any] = (
-            PooledConfluentSchemaRegistryClient
-            if self.schema_registry_transport == "pooled"
-            else ConfluentSchemaRegistryClient
-        )
-
-        return client_cls(
-            self.schema_registry_url,
-            username=username,
-            password=password,
-            headers=headers,
-            timeout_s=self.schema_registry_timeout_s,
-            tls=self.schema_registry_tls(),
-        )
-
-
-class KafkaPluginConfig(BaseModel):
+class KafkaPluginConfig(KafkaConfigSurfaceMixin, BaseModel):
     """Shared plugin-level settings that can be embedded in app config."""
 
     bootstrap_servers: str = Field(description="Kafka bootstrap servers.")
@@ -532,83 +310,3 @@ class KafkaPluginConfig(BaseModel):
     schema_registry_ssl_check_hostname: bool = Field(default=True)
     schema_registry_timeout_s: Annotated[float, Field(gt=0)] = 5.0
     schema_registry_transport: str = Field(default="stdlib")
-
-    def security(self) -> KafkaSecurityConfig | None:
-        cfg = KafkaConfig(
-            bootstrap_servers=self.bootstrap_servers,
-            security_protocol=self.security_protocol,
-            sasl_mechanism=self.sasl_mechanism,
-            sasl_username=self.sasl_username,
-            sasl_username_env=self.sasl_username_env,
-            sasl_password=self.sasl_password,
-            sasl_password_env=self.sasl_password_env,
-            sasl_password_file=self.sasl_password_file,
-            sasl_kerberos_service_name=self.sasl_kerberos_service_name,
-            sasl_kerberos_domain_name=self.sasl_kerberos_domain_name,
-            ssl_cafile=self.ssl_cafile,
-            ssl_cafile_env=self.ssl_cafile_env,
-            ssl_certfile=self.ssl_certfile,
-            ssl_certfile_env=self.ssl_certfile_env,
-            ssl_keyfile=self.ssl_keyfile,
-            ssl_keyfile_env=self.ssl_keyfile_env,
-            ssl_password=self.ssl_password,
-            ssl_password_env=self.ssl_password_env,
-            ssl_password_file=self.ssl_password_file,
-            ssl_check_hostname=self.ssl_check_hostname,
-        )
-        return cfg.security()
-
-    def schema_registry_auth(self) -> tuple[str | None, str | None]:
-        cfg = KafkaConfig(
-            bootstrap_servers=self.bootstrap_servers,
-            schema_registry_username=self.schema_registry_username,
-            schema_registry_username_env=self.schema_registry_username_env,
-            schema_registry_password=self.schema_registry_password,
-            schema_registry_password_env=self.schema_registry_password_env,
-            schema_registry_password_file=self.schema_registry_password_file,
-        )
-        return cfg.schema_registry_auth()
-
-    def schema_registry_tls(self) -> KafkaTLSConfig | None:
-        cfg = KafkaConfig(
-            bootstrap_servers=self.bootstrap_servers,
-            schema_registry_ssl_cafile=self.schema_registry_ssl_cafile,
-            schema_registry_ssl_cafile_env=self.schema_registry_ssl_cafile_env,
-            schema_registry_ssl_certfile=self.schema_registry_ssl_certfile,
-            schema_registry_ssl_certfile_env=self.schema_registry_ssl_certfile_env,
-            schema_registry_ssl_keyfile=self.schema_registry_ssl_keyfile,
-            schema_registry_ssl_keyfile_env=self.schema_registry_ssl_keyfile_env,
-            schema_registry_ssl_password=self.schema_registry_ssl_password,
-            schema_registry_ssl_password_env=self.schema_registry_ssl_password_env,
-            schema_registry_ssl_password_file=self.schema_registry_ssl_password_file,
-            schema_registry_ssl_check_hostname=self.schema_registry_ssl_check_hostname,
-        )
-        return cfg.schema_registry_tls()
-
-    def schema_registry_client(
-        self,
-        *,
-        headers: dict[str, str] | None = None,
-    ) -> Any:
-        cfg = KafkaConfig(
-            bootstrap_servers=self.bootstrap_servers,
-            schema_registry_url=self.schema_registry_url,
-            schema_registry_username=self.schema_registry_username,
-            schema_registry_username_env=self.schema_registry_username_env,
-            schema_registry_password=self.schema_registry_password,
-            schema_registry_password_env=self.schema_registry_password_env,
-            schema_registry_password_file=self.schema_registry_password_file,
-            schema_registry_ssl_cafile=self.schema_registry_ssl_cafile,
-            schema_registry_ssl_cafile_env=self.schema_registry_ssl_cafile_env,
-            schema_registry_ssl_certfile=self.schema_registry_ssl_certfile,
-            schema_registry_ssl_certfile_env=self.schema_registry_ssl_certfile_env,
-            schema_registry_ssl_keyfile=self.schema_registry_ssl_keyfile,
-            schema_registry_ssl_keyfile_env=self.schema_registry_ssl_keyfile_env,
-            schema_registry_ssl_password=self.schema_registry_ssl_password,
-            schema_registry_ssl_password_env=self.schema_registry_ssl_password_env,
-            schema_registry_ssl_password_file=self.schema_registry_ssl_password_file,
-            schema_registry_ssl_check_hostname=self.schema_registry_ssl_check_hostname,
-            schema_registry_timeout_s=self.schema_registry_timeout_s,
-            schema_registry_transport=self.schema_registry_transport,
-        )
-        return cfg.schema_registry_client(headers=headers)

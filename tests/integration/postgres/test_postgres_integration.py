@@ -5,7 +5,8 @@ import json
 from datetime import datetime
 
 import pytest
-from agora import DeliveryConfig, InMemoryCheckpointStore, IterableSource, Pipeline
+from agora import DeliveryConfig, IterableSource, Pipeline
+from agora.core.checkpoint import InMemoryCheckpointStore
 from agora.core.dlq import DLQRecord
 from agora.core.middleware import Middleware
 from agora.core.retry import RetryPolicy
@@ -1827,7 +1828,12 @@ async def test_postgres_source_ha_failover_soak_preserves_resume_semantics_with_
             assert metrics.retry_count == 0
             assert metrics.query_execution_count == 1
             if phase_index < postgres_ha_soak_cycles:
-                transitions.append(await asyncio.to_thread(postgres_ha_control.failover_cycle))
+                transitions.append(
+                    await _run_postgres_ha_step(
+                        postgres_ha_control.failover_cycle,
+                        step_timeout_s=_POSTGRES_HA_FAILOVER_CYCLE_STEP_TIMEOUT_S,
+                    )
+                )
     finally:
         await conn.close()
         conn = await psycopg.AsyncConnection.connect(postgres_ha_dsn, autocommit=True)
@@ -2131,7 +2137,12 @@ async def test_postgres_sink_ha_failover_reconnects_across_multi_cycle_route_cha
             )
 
             if phase_index < postgres_ha_soak_cycles:
-                transitions.append(await asyncio.to_thread(postgres_ha_control.failover_cycle))
+                transitions.append(
+                    await _run_postgres_ha_step(
+                        postgres_ha_control.failover_cycle,
+                        step_timeout_s=_POSTGRES_HA_FAILOVER_CYCLE_STEP_TIMEOUT_S,
+                    )
+                )
 
         metrics = sink.metrics_snapshot()
 

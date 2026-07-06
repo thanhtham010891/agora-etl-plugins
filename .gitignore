@@ -34,6 +34,7 @@ htmlcov/
 # Ignore logs
 *.log
 *.jsonl
+*.json
 !examples/**/data/*.jsonl
 *.txt
 

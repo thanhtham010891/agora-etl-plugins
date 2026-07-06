@@ -4,11 +4,12 @@ import asyncio
 from typing import Any
 
 import pytest
-from agora import DeliveryConfig, Pipeline, SourceRecordError, SourceRecordFailurePolicy
+from agora import DeliveryConfig, Pipeline, SourceRecordFailurePolicy
 from agora.core.acceptance import AcceptanceFinding, AcceptanceReport
 from agora.core.checkpoint import Checkpoint
 from agora.core.health import ComponentHealthSnapshot
 from agora.core.retry import RetryPolicy
+from agora.core.source import SourceRecordError
 
 from agora_plugins.redis import RedisSourceEnterpriseAcceptanceThresholds, RedisStreamSource
 

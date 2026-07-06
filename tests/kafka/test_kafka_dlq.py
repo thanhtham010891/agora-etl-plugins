@@ -13,6 +13,7 @@ from agora_plugins.kafka.dlq import (
     KafkaDLQSource,
     _decode_dlq_envelope,
     _encode_dlq_envelope,
+    _KafkaDLQCompactionState,
     _payload_to_record,
     _record_to_payload,
 )
@@ -109,6 +110,33 @@ def test_kafka_dlq_source_rejects_invalid_limit() -> None:
             assignments=[("dlq", 0)],
             bootstrap_servers="localhost:9092",
             limit=0,
+        )
+
+
+def test_kafka_dlq_source_rejects_conflicting_topic_and_topics() -> None:
+    with pytest.raises(ValueError, match="either `topic` or `topics`"):
+        KafkaDLQSource(
+            topic="dlq",
+            topics=["dlq-backup"],
+            bootstrap_servers="localhost:9092",
+        )
+
+
+def test_kafka_dlq_source_rejects_conflicting_topics_and_topic_pattern() -> None:
+    with pytest.raises(ValueError, match="either `topics` or `topic_pattern`"):
+        KafkaDLQSource(
+            topics=["dlq"],
+            topic_pattern="dlq-.*",
+            bootstrap_servers="localhost:9092",
+        )
+
+
+def test_kafka_dlq_source_rejects_assignments_when_topics_are_set() -> None:
+    with pytest.raises(ValueError, match="accepts `assignments` only"):
+        KafkaDLQSource(
+            topics=["dlq"],
+            assignments=[("dlq", 0)],
+            bootstrap_servers="localhost:9092",
         )
 
 
@@ -212,6 +240,25 @@ def test_kafka_dlq_payload_policy_encrypts_envelope_and_requires_decryptor() -> 
     assert storage_key == "orders-1"
     assert restored is not None
     assert restored.record == {"id": 1, "password": "plain-secret"}
+
+
+def test_kafka_dlq_compaction_uses_in_memory_sqlite_for_spill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_dsn: list[str] = []
+    real_connect = __import__("sqlite3").connect
+
+    def _capture_connect(dsn: str, *args: object, **kwargs: object):
+        observed_dsn.append(dsn)
+        return real_connect(dsn, *args, **kwargs)
+
+    monkeypatch.setattr("agora_plugins.kafka.dlq.sqlite3.connect", _capture_connect)
+    compaction = _KafkaDLQCompactionState(spill_threshold=1, payload_policy=None)
+
+    compaction.update(sequence=0, storage_key="orders-1", record=_make_record())
+    compaction.update(sequence=1, storage_key="orders-2", record=_make_record(run_id="run-2"))
+
+    assert observed_dsn == [":memory:"]
 
 
 def test_kafka_dlq_envelope_round_trip_preserves_storage_key() -> None:

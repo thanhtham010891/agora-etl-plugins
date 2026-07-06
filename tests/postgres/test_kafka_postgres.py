@@ -438,6 +438,36 @@ async def test_kafka_postgres_runtime_observability_snapshot_and_prometheus() ->
 
 
 @pytest.mark.asyncio
+async def test_kafka_postgres_runtime_reads_live_poison_sink_from_source() -> None:
+    source = _FakeSource(
+        {
+            "topic": "orders",
+            "partition": 0,
+            "offset": 9,
+            "payload": "alpha",
+        }
+    )
+    source._agora_postgres_poison_dlq_config = KafkaPostgresPoisonDLQConfig(  # type: ignore[attr-defined]
+        dsn="postgresql://localhost/test",
+        table="orders_dlq",
+        policy=KafkaPoisonRecordPolicy.DLQ_AND_CONTINUE,
+    )
+    source._poison_record_sink = _FakePoisonDLQSink(connection_ready=True, table_ready=True)  # type: ignore[attr-defined]
+    runtime = build_kafka_postgres_runtime(
+        source=source,  # type: ignore[arg-type]
+        dsn="postgresql://localhost/test",
+        table="events",
+        transform=lambda item: {"value": item["payload"]},
+        batch_size=2,
+    )
+    source._poison_record_sink = _FakePoisonDLQSink(connection_ready=False, table_ready=True)  # type: ignore[attr-defined]
+
+    snapshot = await runtime.observability_snapshot()
+
+    assert snapshot.health.poison_dlq_ready is False
+
+
+@pytest.mark.asyncio
 async def test_kafka_postgres_runtime_acceptance_report_uses_runtime_health() -> None:
     source = _FakeSource(
         {

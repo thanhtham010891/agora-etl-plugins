@@ -9,7 +9,7 @@ coordination, and Anthropic provider surfaces.
 
 | Package line | Supported for security fixes | Notes |
 |---|---:|---|
-| `0.4.x` | Yes | Current `agora-etl 0.4.x` plugin line. Requires `agora-etl>=0.4.1,<1` and supports Python `3.11`, `3.12`, and `3.13`. |
+| `0.4.x` | Yes | Current `agora-etl 0.4.x` plugin line. Requires `agora-etl>=0.4.5,<1` and supports Python `3.11`, `3.12`, and `3.13`. |
 | `<0.4` | No | Upgrade to the current line before requesting security fixes. |
 
 Security fixes should be released on the current supported line unless a

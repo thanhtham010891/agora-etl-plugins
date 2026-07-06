@@ -7,8 +7,8 @@ import os
 from typing import cast
 
 import pytest
-from agora import DeliveryConfig, InMemoryCheckpointStore, IterableSource, MapMiddleware, Pipeline
-from agora.core.checkpoint import Checkpoint
+from agora import DeliveryConfig, IterableSource, MapMiddleware, Pipeline
+from agora.core.checkpoint import Checkpoint, InMemoryCheckpointStore
 from agora.core.retry import RetryPolicy
 
 from agora_plugins.kafka import (
@@ -33,6 +33,8 @@ from tests.integration._runtime_readiness import assert_runtime_readiness
 
 pytestmark = pytest.mark.integration
 _INTEGRATION_TIMEOUT_S = 30.0
+_POSTGRES_HA_STEP_TIMEOUT_S = 45.0
+_POSTGRES_HA_FAILOVER_CYCLE_STEP_TIMEOUT_S = 150.0
 _REBALANCE_EVENT_POLL_INTERVAL_S = 0.05
 _SECURE_SOAK_PRODUCER_SETTLE_S = 0.05
 _SECURE_SOAK_REBALANCE_TIMEOUT_S = 12.0
@@ -60,6 +62,15 @@ _RUNTIME_READINESS_THRESHOLDS = KafkaPostgresEnterpriseAcceptanceThresholds(
     max_record_error_count=None,
     max_record_drop_count=None,
 )
+
+
+async def _run_postgres_ha_step(
+    func, /, *args, step_timeout_s: float = _POSTGRES_HA_STEP_TIMEOUT_S, **kwargs
+):
+    return await asyncio.wait_for(
+        asyncio.to_thread(func, *args, **kwargs),
+        timeout=step_timeout_s,
+    )
 
 
 def _cluster_restart_sequence(*, default_cycles: int = 1) -> list[int]:
@@ -3806,14 +3817,19 @@ async def test_kafka_postgres_runtime_delivery_key_survives_multi_cycle_postgres
 
             delivered_count = len(observed_pairs)
             if delivered_count in failover_checkpoints:
-                standby_node = await asyncio.to_thread(postgres_ha_control.current_standby)
-                await asyncio.to_thread(
+                standby_node = await _run_postgres_ha_step(postgres_ha_control.current_standby)
+                await _run_postgres_ha_step(
                     postgres_ha_control.wait_for_table_row_count,
                     standby_node,
                     table,
                     expected_count=delivered_count,
                 )
-                transitions.append(await asyncio.to_thread(postgres_ha_control.failover_cycle))
+                transitions.append(
+                    await _run_postgres_ha_step(
+                        postgres_ha_control.failover_cycle,
+                        step_timeout_s=_POSTGRES_HA_FAILOVER_CYCLE_STEP_TIMEOUT_S,
+                    )
+                )
 
         await conn.close()
         conn = await psycopg.AsyncConnection.connect(postgres_ha_dsn, autocommit=True)

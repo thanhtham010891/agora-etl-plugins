@@ -93,7 +93,7 @@ services:
       REDIS_PROXY_HOST: 0.0.0.0
       REDIS_PROXY_PORT: "6379"
     volumes:
-      - ./scripts/redis_sentinel_proxy.py:/app/redis_sentinel_proxy.py:ro
+      - ./scripts/fixtures/redis_sentinel_proxy.py:/app/redis_sentinel_proxy.py:ro
     ports:
       - "16383:6379"
     healthcheck:

@@ -128,6 +128,80 @@ async def test_build_async_redis_client_uses_cluster_from_url(
     assert calls == [("redis://redis-cluster:6379", {"decode_responses": False})]
 
 
+@pytest.mark.asyncio
+async def test_build_async_redis_client_patches_cluster_redirect_remap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    class _NodesManager:
+        def get_node(
+            self,
+            host: str | None = None,
+            port: int | None = None,
+            node_name: str | None = None,
+        ) -> object | None:
+            calls.append(("get_node", host, port, node_name))
+            if (host, port) == ("127.0.0.1", 16387):
+                return "remapped-node"
+            return None
+
+        def move_slot(self, error: object) -> tuple[str, int, int | None]:
+            calls.append(("move_slot", error.host, error.port, getattr(error, "slot_id", None)))
+            return (
+                error.host,
+                error.port,
+                getattr(error, "slot_id", None),
+            )
+
+    class _ClusterClient:
+        def __init__(self) -> None:
+            self.nodes_manager = _NodesManager()
+
+    class _RedisCluster:
+        @staticmethod
+        def from_url(url: str, **kwargs: object) -> object:
+            calls.append(("from_url", url, kwargs))
+            return _ClusterClient()
+
+    fake_asyncio = SimpleNamespace(RedisCluster=_RedisCluster)
+    monkeypatch.setitem(sys.modules, "redis", SimpleNamespace(asyncio=fake_asyncio))
+    monkeypatch.setitem(sys.modules, "redis.asyncio", fake_asyncio)
+
+    def _remap(address: tuple[str, int]) -> tuple[str, int]:
+        if address == ("redis-cluster-3", 6379):
+            return ("127.0.0.1", 16387)
+        return address
+
+    client = await build_async_redis_client(
+        url="redis://redis-cluster:6379",
+        decode_responses=False,
+        redis_cluster=True,
+        redis_cluster_address_remap=_remap,
+        socket_timeout_s=None,
+        socket_connect_timeout_s=None,
+        health_check_interval_s=None,
+    )
+
+    assert client.nodes_manager.get_node(host="redis-cluster-3", port=6379) == "remapped-node"
+    assert client.nodes_manager.get_node(node_name="redis-cluster-3:6379") == "remapped-node"
+    assert client.nodes_manager.move_slot(
+        SimpleNamespace(host="redis-cluster-3", port=6379, slot_id=42)
+    ) == ("127.0.0.1", 16387, 42)
+    assert calls == [
+        (
+            "from_url",
+            "redis://redis-cluster:6379",
+            {"decode_responses": False, "address_remap": _remap},
+        ),
+        ("get_node", "redis-cluster-3", 6379, None),
+        ("get_node", "127.0.0.1", 16387, None),
+        ("get_node", None, None, "redis-cluster-3:6379"),
+        ("get_node", "127.0.0.1", 16387, None),
+        ("move_slot", "127.0.0.1", 16387, 42),
+    ]
+
+
 def test_build_sync_redis_client_uses_explicit_sentinel_urls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

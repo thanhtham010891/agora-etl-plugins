@@ -1,0 +1,1 @@
+"""BigQuery plugin test package."""

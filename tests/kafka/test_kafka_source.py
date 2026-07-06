@@ -8,13 +8,12 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from agora import (
     DeliveryConfig,
-    InMemoryCheckpointStore,
     Pipeline,
-    SourceRecordError,
     SourceRecordFailurePolicy,
 )
-from agora.core.checkpoint import Checkpoint
+from agora.core.checkpoint import Checkpoint, InMemoryCheckpointStore
 from agora.core.failures import PoisonRecordClassification
+from agora.core.source import SourceRecordError
 
 from agora_plugins.kafka import (
     KafkaOpenTelemetryTracing,
@@ -386,6 +385,14 @@ def test_kafka_source_rejects_assignments_with_topics_or_pattern() -> None:
         KafkaSource(topics=["events"], assignments=[("events", 0)])
 
 
+def test_kafka_source_warns_on_plaintext_non_local_bootstrap() -> None:
+    with pytest.warns(UserWarning, match="bootstrap_servers='broker.prod.example.com:9092'"):
+        KafkaSource(
+            topics=["events"],
+            bootstrap_servers="broker.prod.example.com:9092",
+        )
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
@@ -524,7 +531,7 @@ async def test_close_flushes_pending_manual_commit() -> None:
     assert records == ["a"]
     assert consumer.commit_calls == 1
 
-    source._pending_commit_count = 1  # type: ignore[attr-defined]
+    source._cursor_state.pending_commit_count = 1  # type: ignore[attr-defined]
     await source.close()
 
     assert consumer.commit_calls == 2
@@ -1273,10 +1280,10 @@ async def test_revoked_partitions_drop_checkpoint_history_after_commit() -> None
     consumer = _FakeConsumer([])
     source._consumer = consumer  # type: ignore[attr-defined]
     source._active_assignment = {("t", 0), ("t", 1)}  # type: ignore[attr-defined]
-    source._processed_offsets = {("t", 0): 5, ("t", 1): 8}  # type: ignore[attr-defined]
-    source._committable_offsets = {("t", 0): 5, ("t", 1): 8}  # type: ignore[attr-defined]
-    source._last_seen = ("t", 1, 8)  # type: ignore[attr-defined]
-    source._pending_commit_count = 2  # type: ignore[attr-defined]
+    source._cursor_state.processed_offsets = {("t", 0): 5, ("t", 1): 8}  # type: ignore[attr-defined]
+    source._cursor_state.committable_offsets = {("t", 0): 5, ("t", 1): 8}  # type: ignore[attr-defined]
+    source._cursor_state.last_seen = ("t", 1, 8)  # type: ignore[attr-defined]
+    source._cursor_state.pending_commit_count = 2  # type: ignore[attr-defined]
 
     await source._handle_partitions_revoked({("t", 1)})
 
@@ -1292,7 +1299,7 @@ async def test_revoked_partitions_drop_checkpoint_history_after_commit() -> None
             {"topic": "t", "partition": 0, "offset": 5},
         ],
     }
-    assert source._committable_offsets == {("t", 0): 5}  # type: ignore[attr-defined]
+    assert source._cursor_state.committable_offsets == {("t", 0): 5}  # type: ignore[attr-defined]
     assert source._active_assignment == {("t", 0)}  # type: ignore[attr-defined]
 
 
@@ -1452,8 +1459,8 @@ async def test_kafka_source_close_stops_consumer_even_if_commit_fails() -> None:
 
     consumer = FakeConsumer()
     source._consumer = consumer  # type: ignore[attr-defined]
-    source._pending_commit_count = 1  # type: ignore[attr-defined]
-    source._processed_offsets = {("events", 0): 7}  # type: ignore[attr-defined]
+    source._cursor_state.pending_commit_count = 1  # type: ignore[attr-defined]
+    source._cursor_state.processed_offsets = {("events", 0): 7}  # type: ignore[attr-defined]
 
     await source.close()
 
@@ -1545,9 +1552,9 @@ async def test_commit_now_flushes_tracked_offsets_immediately() -> None:
     consumer = _FakeConsumer([b"a"])
     source._consumer = consumer  # type: ignore[attr-defined]
     source._topic_partition_cls = _FakeTopicPartition  # type: ignore[attr-defined]
-    source._processed_offsets = {("t", 0): 7, ("t", 1): 2}  # type: ignore[attr-defined]
-    source._committable_offsets = {("t", 0): 7, ("t", 1): 2}  # type: ignore[attr-defined]
-    source._pending_commit_count = 2  # type: ignore[attr-defined]
+    source._cursor_state.processed_offsets = {("t", 0): 7, ("t", 1): 2}  # type: ignore[attr-defined]
+    source._cursor_state.committable_offsets = {("t", 0): 7, ("t", 1): 2}  # type: ignore[attr-defined]
+    source._cursor_state.pending_commit_count = 2  # type: ignore[attr-defined]
 
     await source.commit_now()
 
@@ -1557,7 +1564,7 @@ async def test_commit_now_flushes_tracked_offsets_immediately() -> None:
             _FakeTopicPartition("t", 1): 3,
         }
     ]
-    assert source._pending_commit_count == 0  # type: ignore[attr-defined]
+    assert source._cursor_state.pending_commit_count == 0  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
@@ -1575,9 +1582,9 @@ async def test_seek_to_offsets_repositions_consumer_and_discards_pending_trackin
     ]
     source._consumer = consumer  # type: ignore[attr-defined]
     source._topic_partition_cls = _FakeTopicPartition  # type: ignore[attr-defined]
-    source._processed_offsets = {("t", 0): 7}  # type: ignore[attr-defined]
-    source._pending_commit_count = 1  # type: ignore[attr-defined]
-    source._last_seen = ("t", 0, 7)  # type: ignore[attr-defined]
+    source._cursor_state.processed_offsets = {("t", 0): 7}  # type: ignore[attr-defined]
+    source._cursor_state.pending_commit_count = 1  # type: ignore[attr-defined]
+    source._cursor_state.last_seen = ("t", 0, 7)  # type: ignore[attr-defined]
 
     await source.seek_to_offsets({("t", 0): 15, ("t", 1): 23})
 
@@ -1585,9 +1592,9 @@ async def test_seek_to_offsets_repositions_consumer_and_discards_pending_trackin
         (_FakeTopicPartition("t", 0), 15),
         (_FakeTopicPartition("t", 1), 23),
     ]
-    assert source._start_offsets == {("t", 0): 15, ("t", 1): 23}  # type: ignore[attr-defined]
-    assert source._processed_offsets == {}  # type: ignore[attr-defined]
-    assert source._pending_commit_count == 0  # type: ignore[attr-defined]
+    assert source._cursor_state.start_offsets == {("t", 0): 15, ("t", 1): 23}  # type: ignore[attr-defined]
+    assert source._cursor_state.processed_offsets == {}  # type: ignore[attr-defined]
+    assert source._cursor_state.pending_commit_count == 0  # type: ignore[attr-defined]
     assert source.current_checkpoint() is None
 
 
@@ -1629,6 +1636,28 @@ async def test_seek_helpers_reject_unassigned_partitions() -> None:
 
     with pytest.raises(ValueError, match="assigned partitions"):
         await source.seek_to_beginning([("missing", 0)])
+
+
+@pytest.mark.asyncio
+async def test_pause_and_resume_reject_unassigned_partitions() -> None:
+    source = KafkaSource(
+        topics=["events"],
+        deserializer=lambda b: b.decode(),
+        enable_auto_commit=False,
+        commit_every=100,
+    )
+    consumer = _FakeConsumer([b"a"])
+    source._consumer = consumer  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="assigned partitions"):
+        source.pause([("missing", 0)])
+
+    with pytest.raises(ValueError, match="assigned partitions"):
+        source.resume([("missing", 0)])
+
+    assert consumer.pause_calls == []
+    assert consumer.resume_calls == []
+    assert source._paused_partitions == set()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
@@ -1869,9 +1898,9 @@ async def test_rebalance_listener_commits_before_revocation(
     )
 
     await source.open()
-    source._processed_offsets = {("events", 0): 7}  # type: ignore[attr-defined]
-    source._committable_offsets = {("events", 0): 7}  # type: ignore[attr-defined]
-    source._pending_commit_count = 1  # type: ignore[attr-defined]
+    source._cursor_state.processed_offsets = {("events", 0): 7}  # type: ignore[attr-defined]
+    source._cursor_state.committable_offsets = {("events", 0): 7}  # type: ignore[attr-defined]
+    source._cursor_state.pending_commit_count = 1  # type: ignore[attr-defined]
 
     listener = seen["listener"]
     assert listener is not None
@@ -1885,7 +1914,7 @@ async def test_rebalance_listener_commits_before_revocation(
         ("assigned", [_FakeTopicPartition("events", 0)]),
         ("revoked", [_FakeTopicPartition("events", 0)]),
     ]
-    assert source._processed_offsets == {}  # type: ignore[attr-defined]
+    assert source._cursor_state.processed_offsets == {}  # type: ignore[attr-defined]
     assert source.operational_metrics().to_dict() == {
         "rebalance_count": 1,
         "batch_deserialize_error_count": 0,
@@ -2027,11 +2056,11 @@ async def test_health_snapshot_reports_assignment_lag_and_readiness() -> None:
     source._topic_partition_cls = _FakeTopicPartition  # type: ignore[attr-defined]
     source._active_assignment = {("events", 0), ("events", 1)}  # type: ignore[attr-defined]
     source._paused_partitions = {("events", 1)}  # type: ignore[attr-defined]
-    source._pending_commit_count = 2  # type: ignore[attr-defined]
+    source._cursor_state.pending_commit_count = 2  # type: ignore[attr-defined]
     source._idle_poll_count = 1  # type: ignore[attr-defined]
     source._rebalance_count = 3  # type: ignore[attr-defined]
-    source._processed_offsets = {("events", 0): 1, ("events", 1): 4}  # type: ignore[attr-defined]
-    source._committable_offsets = {("events", 0): 0, ("events", 1): 4}  # type: ignore[attr-defined]
+    source._cursor_state.processed_offsets = {("events", 0): 1, ("events", 1): 4}  # type: ignore[attr-defined]
+    source._cursor_state.committable_offsets = {("events", 0): 0, ("events", 1): 4}  # type: ignore[attr-defined]
 
     snapshot = await source.health_snapshot()
 
@@ -2076,6 +2105,27 @@ async def test_health_snapshot_reports_assignment_lag_and_readiness() -> None:
             "paused": True,
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_health_snapshot_clears_stale_assignment_when_consumer_reports_none() -> None:
+    source = KafkaSource(
+        topics=["events"],
+        deserializer=lambda b: b.decode(),
+        enable_auto_commit=False,
+        commit_every=5,
+    )
+    consumer = _FakeConsumer([b"a"])
+    consumer._messages = []  # type: ignore[attr-defined]
+    source._consumer = consumer  # type: ignore[attr-defined]
+    source._active_assignment = {("events", 0)}  # type: ignore[attr-defined]
+
+    snapshot = await source.health_snapshot(force_refresh=True)
+
+    assert snapshot.ready is False
+    assert snapshot.assignment_count == 0
+    assert snapshot.partitions == ()
+    assert source._active_assignment == set()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio

@@ -7,8 +7,8 @@ import time
 from datetime import UTC, datetime
 
 import pytest
-from agora import DeliveryConfig, InMemoryCheckpointStore, IterableSource, Pipeline
-from agora.core.checkpoint import Checkpoint, SQLiteCheckpointStore
+from agora import DeliveryConfig, IterableSource, Pipeline
+from agora.core.checkpoint import Checkpoint, InMemoryCheckpointStore, SQLiteCheckpointStore
 from agora.core.dlq import DLQRecord
 from agora.core.types import DedupStoreFailurePolicy, SourceRecordFailurePolicy
 from agora.middlewares.dedup import DedupMiddleware

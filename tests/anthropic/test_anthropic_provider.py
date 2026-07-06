@@ -10,7 +10,13 @@ import pytest
 from agora.ai.providers.base import CompletionResponse
 from pydantic import BaseModel
 
-from agora_plugins.anthropic import MANIFEST, AnthropicProvider
+from agora_plugins.anthropic import (
+    MANIFEST,
+    AnthropicProvider,
+    AnthropicProviderBootstrap,
+    AnthropicRequestRuntime,
+    AnthropicResponseSurface,
+)
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 _PYPROJECT_PATH = _PACKAGE_ROOT / "pyproject.toml"
@@ -83,6 +89,12 @@ def test_package_root_exports_manifest_and_provider() -> None:
 
     assert "MANIFEST" in __all__
     assert "AnthropicProvider" in __all__
+    assert "AnthropicProviderBootstrap" in __all__
+    assert "AnthropicRequestRuntime" in __all__
+    assert "AnthropicResponseSurface" in __all__
+    assert AnthropicProviderBootstrap.__name__ == "AnthropicProviderBootstrap"
+    assert AnthropicRequestRuntime.__name__ == "AnthropicRequestRuntime"
+    assert AnthropicResponseSurface.__name__ == "AnthropicResponseSurface"
 
 
 def test_pyproject_registers_anthropic_extra_and_entrypoint() -> None:
@@ -647,6 +659,55 @@ async def test_stream_complete_does_not_retry_after_yielding_chunk(
 
 
 @pytest.mark.asyncio
+async def test_stream_complete_honors_request_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _SlowStream:
+        async def __aenter__(self) -> _SlowStream:
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            del exc_type, exc, tb
+
+        def __aiter__(self) -> _SlowStream:
+            self._done = False
+            return self
+
+        async def __anext__(self) -> object:
+            if self._done:
+                raise StopAsyncIteration
+            await asyncio.sleep(0.05)
+            self._done = True
+            return SimpleNamespace(delta=SimpleNamespace(text="late"))
+
+    class _FakeMessages:
+        def stream(self, **kwargs: object) -> _SlowStream:
+            del kwargs
+            return _SlowStream()
+
+    class _FakeAsyncAnthropic:
+        def __init__(
+            self, *, api_key: str, max_retries: int = 0, timeout: float | None = None
+        ) -> None:
+            del api_key, max_retries, timeout
+            self.messages = _FakeMessages()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=_FakeAsyncAnthropic),
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stream-timeout-key")
+
+    provider = AnthropicProvider(
+        request_timeout_s=0.01,
+        max_retries=1,
+        retry_initial_backoff_s=0,
+    )
+
+    with pytest.raises(TimeoutError):
+        _ = [chunk async for chunk in provider.stream_complete("hello")]
+
+
+@pytest.mark.asyncio
 async def test_complete_batch_uses_concurrency_throttle(monkeypatch: pytest.MonkeyPatch) -> None:
     active = 0
     max_active = 0
@@ -992,6 +1053,21 @@ def test_provider_can_opt_into_unknown_model(monkeypatch: pytest.MonkeyPatch) ->
     )
 
     assert provider.model == "claude-9-9-phantom-20990101"
+
+
+def test_provider_bootstrap_resolves_api_key_and_model_from_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "bootstrap-key")
+    bootstrap = AnthropicProviderBootstrap(
+        supported_models=frozenset({"claude-haiku-4-5-20251001"})
+    )
+
+    assert bootstrap.resolve_api_key(None) == "bootstrap-key"
+    assert (
+        bootstrap.resolve_model(" claude-haiku-4-5-20251001 ", allow_unknown_models=False)
+        == "claude-haiku-4-5-20251001"
+    )
 
 
 @pytest.mark.asyncio

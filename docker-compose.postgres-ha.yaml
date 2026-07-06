@@ -9,7 +9,7 @@ services:
       POSTGRESQL_DATABASE: agora_test
       REPMGR_USERNAME: repmgr
       REPMGR_PASSWORD: repmgrpass
-      REPMGR_PRIMARY_HOST: postgres-primary
+      REPMGR_PRIMARY_HOST: ${AGORA_TEST_POSTGRES_PRIMARY_HOST:-postgres-primary}
       REPMGR_PARTNER_NODES: postgres-primary,postgres-standby
       REPMGR_NODE_NAME: postgres-primary-1
       REPMGR_NODE_ID: 1
@@ -38,7 +38,7 @@ services:
       POSTGRESQL_DATABASE: agora_test
       REPMGR_USERNAME: repmgr
       REPMGR_PASSWORD: repmgrpass
-      REPMGR_PRIMARY_HOST: postgres-primary
+      REPMGR_PRIMARY_HOST: ${AGORA_TEST_POSTGRES_STANDBY_PRIMARY_HOST:-postgres-primary}
       REPMGR_PARTNER_NODES: postgres-primary,postgres-standby
       REPMGR_NODE_NAME: postgres-standby-2
       REPMGR_NODE_ID: 2

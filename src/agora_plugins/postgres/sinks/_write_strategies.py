@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import logstruct
 from agora.core.retry import RetryPolicy, retry_async
@@ -15,19 +15,21 @@ if TYPE_CHECKING:
 
 logger = logstruct.getLogger("agora_plugins.postgres.sinks.postgres")
 
+Row = dict[str, object]
+
 
 class PostgresWriteOwner(Protocol):
     """Minimal sink surface required by SQL/COPY strategy execution."""
 
     _table: str | QuotedIdentifier
 
-    def _write_connection(self) -> AbstractAsyncContextManager[Any]: ...
+    def _write_connection(self) -> AbstractAsyncContextManager[object]: ...
 
     def _iter_sql_chunks(
         self,
-        rows: list[dict[str, Any]],
+        rows: list[Row],
         columns: list[str],
-    ) -> Iterator[list[dict[str, Any]]]: ...
+    ) -> Iterator[list[Row]]: ...
 
     def _build_batch_upsert_sql(
         self,
@@ -38,9 +40,9 @@ class PostgresWriteOwner(Protocol):
 
     def _flatten_rows(
         self,
-        rows: list[dict[str, Any]],
+        rows: list[Row],
         columns: list[str],
-    ) -> list[Any]: ...
+    ) -> list[object]: ...
 
     def _build_copy_sql(self, columns: Sequence[str | QuotedIdentifier]) -> str: ...
 
@@ -66,17 +68,17 @@ class PostgresWriteOwner(Protocol):
         self,
         exc: Exception,
         *,
-        rows: list[dict[str, Any]],
+        rows: list[Row],
         columns: list[str],
     ) -> Exception: ...
 
 
 async def flush_via_sql(
     owner: PostgresWriteOwner,
-    rows: list[dict[str, Any]],
+    rows: list[Row],
     columns: list[str],
     count: int,
-    policy: RetryPolicy[Any],
+    policy: RetryPolicy[None],
 ) -> None:
     def _on_retry(attempt: int, exc: Exception, delay: float) -> None:
         logger.warning(
@@ -95,14 +97,7 @@ async def flush_via_sql(
                 await execute_sql_batch(owner, conn, rows, columns)
                 await conn.commit()
             except Exception:
-                try:
-                    await conn.rollback()
-                except Exception:
-                    logger.exception(
-                        "postgres_rollback_error",
-                        table=owner._table,
-                        count=count,
-                    )
+                await rollback_best_effort(conn, owner=owner, count=count)
                 raise
 
     try:
@@ -118,7 +113,7 @@ async def flush_via_sql(
 
 async def flush_via_copy(
     owner: PostgresWriteOwner,
-    rows: list[dict[str, Any]],
+    rows: list[Row],
     columns: list[str],
     count: int,
 ) -> None:
@@ -128,14 +123,7 @@ async def flush_via_copy(
                 await execute_copy_batch(owner, conn, rows, columns)
                 await conn.commit()
             except Exception:
-                try:
-                    await conn.rollback()
-                except Exception:
-                    logger.exception(
-                        "postgres_rollback_error",
-                        table=owner._table,
-                        count=count,
-                    )
+                await rollback_best_effort(conn, owner=owner, count=count)
                 raise
 
     try:
@@ -147,10 +135,10 @@ async def flush_via_copy(
 
 async def flush_via_copy_merge(
     owner: PostgresWriteOwner,
-    rows: list[dict[str, Any]],
+    rows: list[Row],
     columns: list[str],
     count: int,
-    policy: RetryPolicy[Any],
+    policy: RetryPolicy[None],
 ) -> None:
     staging_table = owner._build_stage_table_name()
     create_sql = owner._build_create_temp_table_sql(staging_table)
@@ -183,14 +171,7 @@ async def flush_via_copy_merge(
                 )
                 await conn.commit()
             except Exception:
-                try:
-                    await conn.rollback()
-                except Exception:
-                    logger.exception(
-                        "postgres_rollback_error",
-                        table=owner._table,
-                        count=count,
-                    )
+                await rollback_best_effort(conn, owner=owner, count=count)
                 raise
 
     try:
@@ -204,10 +185,26 @@ async def flush_via_copy_merge(
         raise owner._wrap_write_error(exc, rows=rows, columns=columns) from exc
 
 
+async def rollback_best_effort(
+    conn: object,
+    *,
+    owner: PostgresWriteOwner,
+    count: int,
+) -> None:
+    try:
+        await conn.rollback()
+    except Exception:
+        logger.exception(
+            "postgres_rollback_error",
+            table=owner._table,
+            count=count,
+        )
+
+
 async def execute_sql_batch(
     owner: PostgresWriteOwner,
-    conn: Any,
-    rows: list[dict[str, Any]],
+    conn: object,
+    rows: list[Row],
     columns: list[str],
 ) -> None:
     async with conn.cursor() as cur:
@@ -219,8 +216,8 @@ async def execute_sql_batch(
 
 async def execute_copy_batch(
     owner: PostgresWriteOwner,
-    conn: Any,
-    rows: list[dict[str, Any]],
+    conn: object,
+    rows: list[Row],
     columns: list[str],
 ) -> None:
     sql = owner._build_copy_sql(columns)
@@ -231,8 +228,8 @@ async def execute_copy_batch(
 
 async def execute_copy_merge_batch(
     owner: PostgresWriteOwner,
-    conn: Any,
-    rows: list[dict[str, Any]],
+    conn: object,
+    rows: list[Row],
     columns: list[str],
     *,
     staging_table: str | None = None,

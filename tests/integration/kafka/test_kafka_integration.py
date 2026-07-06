@@ -6,8 +6,8 @@ import json
 from datetime import UTC, datetime
 
 import pytest
-from agora import DeliveryConfig, InMemoryCheckpointStore, Pipeline
-from agora.core.checkpoint import Checkpoint, SQLiteCheckpointStore
+from agora import DeliveryConfig, Pipeline
+from agora.core.checkpoint import Checkpoint, InMemoryCheckpointStore, SQLiteCheckpointStore
 from agora.core.dlq import DLQRecord
 from agora.core.source import IterableSource
 

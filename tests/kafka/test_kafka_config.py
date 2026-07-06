@@ -179,6 +179,19 @@ def test_kafka_config_builds_first_class_security_config() -> None:
     assert security.tls.cafile == "/tmp/ca.pem"
 
 
+def test_kafka_config_warns_on_plaintext_outside_local_dev_posture() -> None:
+    config = KafkaConfig(
+        bootstrap_servers="broker.prod.example.com:9092",
+        security_protocol="PLAINTEXT",
+        env="prod",
+    )
+
+    with pytest.warns(UserWarning, match="PLAINTEXT outside a clearly local development posture"):
+        security = config.security()
+
+    assert security is None
+
+
 def test_kafka_config_builds_gssapi_security_config() -> None:
     config = KafkaConfig(
         bootstrap_servers="localhost:9092",
@@ -227,6 +240,18 @@ def test_kafka_plugin_config_reuses_security_builder() -> None:
     assert security.tls is not None
     assert security.tls.cafile == "/tmp/ca.pem"
     assert security.tls.check_hostname is False
+
+
+def test_kafka_plugin_config_warns_on_plaintext_non_local_bootstrap() -> None:
+    config = KafkaPluginConfig(
+        bootstrap_servers="10.10.1.25:9092",
+        security_protocol="PLAINTEXT",
+    )
+
+    with pytest.warns(UserWarning, match="bootstrap_servers='10.10.1.25:9092'"):
+        security = config.security()
+
+    assert security is None
 
 
 def test_kafka_plugin_config_passes_gssapi_fields() -> None:

@@ -9,6 +9,23 @@ from typing import Any
 from agora.core.failures import PoisonRecordClassification, PoisonRecordInfo
 from agora.core.health import ComponentHealthSnapshot
 
+try:
+    from agora.core.failures import PoisonRecordPolicy as _CorePoisonRecordPolicy
+except ImportError:
+    # Keep the Kafka plugin wheel compatible with older published core builds
+    # that do not yet export PoisonRecordPolicy.
+    class KafkaPoisonRecordPolicy(StrEnum):
+        """Source-side poison-record handling policy for Kafka ingestion."""
+
+        FAIL_CLOSED = "fail_closed"
+        LOG_AND_CONTINUE = "log_and_continue"
+        DLQ_AND_CONTINUE = "dlq_and_continue"
+        DLQ_AND_FAIL_CLOSED = "dlq_and_fail_closed"
+
+
+else:
+    KafkaPoisonRecordPolicy = _CorePoisonRecordPolicy
+
 
 @dataclass(frozen=True, slots=True)
 class BatchMessageContext:
@@ -93,15 +110,6 @@ class KafkaDeliveryContext:
             "timestamp_type": self.timestamp_type,
             "delivery_id": self.delivery_id,
         }
-
-
-class KafkaPoisonRecordPolicy(StrEnum):
-    """Policy for source-side poison records that fail Kafka deserialization."""
-
-    FAIL_CLOSED = "fail_closed"
-    LOG_AND_CONTINUE = "log_and_continue"
-    DLQ_AND_CONTINUE = "dlq_and_continue"
-    DLQ_AND_FAIL_CLOSED = "dlq_and_fail_closed"
 
 
 KafkaPoisonRecordClassification = PoisonRecordClassification

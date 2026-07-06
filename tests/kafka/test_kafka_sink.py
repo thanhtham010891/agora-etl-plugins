@@ -50,6 +50,15 @@ class _FakePropagator:
         self.injected.append(dict(carrier))
 
 
+def test_kafka_sink_warns_on_plaintext_non_local_bootstrap() -> None:
+    with pytest.warns(UserWarning, match="bootstrap_servers='broker.prod.example.com:9092'"):
+        KafkaSink(
+            topic="test-topic",
+            bootstrap_servers="broker.prod.example.com:9092",
+            serializer=lambda r: r.encode("utf-8"),
+        )
+
+
 @pytest.mark.asyncio
 async def test_kafka_sink_write_sends_serialized_value() -> None:
     sink = KafkaSink(
@@ -500,7 +509,7 @@ def test_kafka_sink_rejects_transaction_per_batch_without_transactional_id() -> 
 
 
 @pytest.mark.asyncio
-async def test_kafka_sink_transactional_id_wraps_single_write_in_transaction() -> None:
+async def test_kafka_sink_transactional_id_does_not_implicitly_wrap_single_write() -> None:
     sink = KafkaSink(
         topic="test-topic",
         bootstrap_servers="localhost:9092",
@@ -519,9 +528,9 @@ async def test_kafka_sink_transactional_id_wraps_single_write_in_transaction() -
 
     await sink.write("one")
 
-    mock_producer.begin_transaction.assert_awaited_once()
+    mock_producer.begin_transaction.assert_not_awaited()
     mock_producer.send.assert_awaited_once()
-    mock_producer.commit_transaction.assert_awaited_once()
+    mock_producer.commit_transaction.assert_not_awaited()
     mock_producer.abort_transaction.assert_not_awaited()
 
 
@@ -555,7 +564,9 @@ async def test_kafka_sink_transaction_per_batch_commits_transaction() -> None:
 
 
 @pytest.mark.asyncio
-async def test_kafka_sink_transactional_id_wraps_batch_even_without_transaction_per_batch() -> None:
+async def test_kafka_sink_transactional_id_does_not_wrap_batch_without_transaction_per_batch() -> (
+    None
+):
     sink = KafkaSink(
         topic="test-topic",
         bootstrap_servers="localhost:9092",
@@ -576,8 +587,8 @@ async def test_kafka_sink_transactional_id_wraps_batch_even_without_transaction_
 
     await sink.write_batch(["one", "two"])
 
-    mock_producer.begin_transaction.assert_awaited_once()
-    mock_producer.commit_transaction.assert_awaited_once()
+    mock_producer.begin_transaction.assert_not_awaited()
+    mock_producer.commit_transaction.assert_not_awaited()
     mock_producer.abort_transaction.assert_not_awaited()
 
 
@@ -935,7 +946,7 @@ async def test_kafka_sink_awaits_oldest_ack_when_window_is_full(
 
 
 @pytest.mark.asyncio
-async def test_kafka_sink_does_not_retry_transient_send_errors(
+async def test_kafka_sink_retries_transient_send_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(kafka_module, "_AIOKAFKA_AVAILABLE", True)
@@ -948,6 +959,7 @@ async def test_kafka_sink_does_not_retry_transient_send_errors(
             initial_backoff_s=0.0,
             retry_exceptions=(RuntimeError,),
         ),
+        max_pending_acks=1,
     )
 
     class FakeProducer:
@@ -976,7 +988,46 @@ async def test_kafka_sink_does_not_retry_transient_send_errors(
     producer = FakeProducer()
     sink._producer = producer  # type: ignore[attr-defined]
 
-    with pytest.raises(RuntimeError, match="broker busy"):
+    await sink.write("hello")
+
+    assert producer.send_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_kafka_sink_does_not_retry_non_retryable_delivery_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(kafka_module, "_AIOKAFKA_AVAILABLE", True)
+    sink = KafkaSink(
+        topic="events",
+        bootstrap_servers="localhost:9092",
+        serializer=lambda record: str(record).encode(),
+        retry_policy=RetryPolicy[Any](
+            max_attempts=2,
+            initial_backoff_s=0.0,
+            retry_exceptions=(RuntimeError,),
+        ),
+        max_pending_acks=1,
+    )
+
+    class FakeProducer:
+        def __init__(self) -> None:
+            self.send_calls = 0
+
+        async def send(self, topic: str, **kwargs: object) -> asyncio.Future[None]:
+            del topic, kwargs
+            self.send_calls += 1
+            delivery: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            delivery.set_exception(ValueError("invalid record"))
+            return delivery
+
+        async def flush(self) -> None:
+            return None
+
+    producer = FakeProducer()
+    sink._producer = producer  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="invalid record"):
         await sink.write("hello")
 
     assert producer.send_calls == 1

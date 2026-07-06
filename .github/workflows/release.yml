@@ -1,4 +1,4 @@
-name: Release package version
+name: Publish release
 
 on:
   release:
@@ -8,24 +8,35 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event.release.tag_name || github.ref }}
+  group: release-${{ github.event.release.tag_name }}
   cancel-in-progress: false
 
 jobs:
-  release-build:
+  publish:
+    name: Verify tag, package, and publish to PyPI
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: pypi
+      url: https://pypi.org/project/agora-etl-plugins/
     steps:
-      - name: Checkout
+      - name: Checkout release tag
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
       - name: Validate release tag matches package version
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           python - <<'PY'
           import os
@@ -35,14 +46,12 @@ jobs:
           version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
           expected_tag = f"v{version}"
           release_tag = os.environ["RELEASE_TAG"]
-
           if release_tag != expected_tag:
               raise SystemExit(
                   f"Release tag {release_tag!r} does not match package version {version!r}. "
-                  f"Expected tag: {expected_tag!r}."
+                  f"Expected {expected_tag!r}."
               )
-
-          print(f"Validated release tag {release_tag} for agora-etl-plugins {version}.")
+          print(f"Validated release tag {release_tag}.")
           PY
 
       - name: Setup environment
@@ -50,31 +59,10 @@ jobs:
           BOOTSTRAP_PYTHON: python
         run: make setup
 
-      - name: Build release distributions
-        run: ./.venv/bin/hatch build
+      - name: Build and verify the release package
+        env:
+          BOOTSTRAP_PYTHON: python
+        run: make verify-package
 
-      - name: Upload distributions
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-dists
-          path: dist/
-          if-no-files-found: error
-
-  pypi-publish:
-    needs:
-      - release-build
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-    environment:
-      name: pypi
-      url: https://pypi.org/project/agora-etl-plugins/
-    steps:
-      - name: Retrieve release distributions
-        uses: actions/download-artifact@v5
-        with:
-          name: release-dists
-          path: dist/
-
-      - name: Publish release distributions to PyPI
+      - name: Publish the verified distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

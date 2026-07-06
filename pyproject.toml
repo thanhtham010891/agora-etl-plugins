@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agora-etl-plugins"
-version = "0.4.1"
-description = "Official plugins for agora-etl — Redis, cron scheduling, distributed coordination, Kafka, PostgreSQL, and Anthropic AI support."
+version = "0.4.2"
+description = "Official plugins for agora-etl — Redis, Kafka, PostgreSQL, BigQuery, S3, cron scheduling, distributed coordination, and Anthropic AI support."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
-keywords = ["etl", "pipeline", "async", "kafka", "postgres", "redis", "cron", "distributed", "anthropic", "llm", "data-engineering"]
+keywords = ["etl", "pipeline", "async", "kafka", "postgres", "redis", "bigquery", "s3", "cron", "distributed", "anthropic", "llm", "data-engineering"]
 authors = [
     { name = "Tham Tra" },
 ]
@@ -24,7 +24,7 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 dependencies = [
-    "agora-etl>=0.4.1,<1",
+    "agora-etl>=0.4.5,<1",
 ]
 
 [project.urls]
@@ -56,11 +56,20 @@ postgres = [
 anthropic = [
     "anthropic>=0.99,<1",
 ]
+bigquery = [
+    "google-cloud-bigquery>=3.38,<4",
+    "google-cloud-bigquery-storage>=2.39,<3",
+]
+s3 = [
+    "boto3>=1.39,<2",
+    "pyarrow>=18.0,<25",
+    "orjson>=3.11,<4",
+]
 all = [
-    "agora-etl-plugins[redis,cron,distributed,kafka,postgres,anthropic]",
+    "agora-etl-plugins[redis,cron,distributed,kafka,postgres,anthropic,bigquery,s3]",
 ]
 dev = [
-    "agora-etl[dev]",
+    "agora-etl[dev,file]",
 ]
 
 # ======================================================================
@@ -74,6 +83,8 @@ kafka = "agora_plugins.kafka.sources.kafka:KafkaSource"
 kafka_dlq_source = "agora_plugins.kafka.dlq:KafkaDLQSource"
 postgres = "agora_plugins.postgres.sources.postgres:PostgresSource"
 postgres_dlq_source = "agora_plugins.postgres.dlq:PostgresDLQSource"
+bigquery = "agora_plugins.bigquery.sources.bigquery:BigQuerySource"
+s3 = "agora_plugins.s3.sources.s3:S3Source"
 
 [project.entry-points."agora.sinks"]
 redis = "agora_plugins.redis.sinks.redis:RedisSink"
@@ -83,6 +94,9 @@ kafka_dlq = "agora_plugins.kafka.dlq:KafkaDLQSink"
 postgres = "agora_plugins.postgres.sinks.postgres:PostgresSink"
 postgres_schema_adapter = "agora_plugins.postgres.sinks.postgres:PostgresSchemaAdapter"
 postgres_dlq = "agora_plugins.postgres.dlq:PostgresDLQSink"
+bigquery = "agora_plugins.bigquery.sinks.bigquery:BigQuerySink"
+bigquery_storage_write = "agora_plugins.bigquery.sinks.storage_write:BigQueryStorageWriteSink"
+s3 = "agora_plugins.s3.sinks.s3:S3Sink"
 
 [project.entry-points."agora.ai.caches"]
 redis = "agora_plugins.redis.ai.cache:RedisLLMCache"
@@ -96,6 +110,11 @@ redis_embedding = "agora_plugins.redis.dedup.stores.embedding:RedisEmbeddingStor
 
 [project.entry-points."agora.state.backends"]
 redis = "agora_plugins.redis.state.redis:RedisBackend"
+
+[project.entry-points."agora.doctor.readiness"]
+kafka = "agora_plugins.kafka.doctor:DOCTOR_READINESS_PROVIDER"
+postgres = "agora_plugins.postgres.doctor:DOCTOR_READINESS_PROVIDER"
+redis = "agora_plugins.redis.doctor:DOCTOR_READINESS_PROVIDER"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agora_plugins"]
@@ -133,3 +152,15 @@ fail_under = 80
 python_version = "3.11"
 strict = true
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "agora_plugins.anthropic.*",
+    "agora_plugins.bigquery.*",
+    "agora_plugins.distributed.*",
+    "agora_plugins.dlq_policy",
+    "agora_plugins.kafka.*",
+    "agora_plugins.postgres.*",
+    "agora_plugins.redis.*",
+]
+ignore_errors = true

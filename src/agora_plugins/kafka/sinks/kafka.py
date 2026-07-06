@@ -8,9 +8,7 @@ from __future__ import annotations
 
 from collections import deque
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from functools import lru_cache
-from inspect import Parameter, isawaitable, iscoroutinefunction, signature
+from inspect import isawaitable, iscoroutinefunction
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 import logstruct
@@ -18,7 +16,26 @@ from agora.core.retry import RetryPolicy, retry_async
 from agora.core.sink import BaseSink
 
 from agora_plugins.kafka._lifecycle import call_lifecycle
+from agora_plugins.kafka._security_posture import warn_if_insecure_plaintext
 from agora_plugins.kafka.config import KafkaSecurityConfig
+from agora_plugins.kafka.sinks._message import (
+    UNSET as _UNSET,
+)
+from agora_plugins.kafka.sinks._message import (
+    KafkaSinkMessage,
+)
+from agora_plugins.kafka.sinks._message import (
+    ResolvedKafkaSinkMessage as _ResolvedKafkaSinkMessage,
+)
+from agora_plugins.kafka.sinks._message import (
+    coerce_headers as _coerce_headers,
+)
+from agora_plugins.kafka.sinks._producer_options import (
+    producer_supported_kwargs as _producer_supported_kwargs_for,
+)
+from agora_plugins.kafka.sinks._producer_options import (
+    validate_producer_tuning as _validate_producer_tuning,
+)
 from agora_plugins.kafka.tracing import KafkaOpenTelemetryTracing
 
 if TYPE_CHECKING:
@@ -35,81 +52,13 @@ except ImportError:
 
 T = TypeVar("T")
 logger = logstruct.getLogger(__name__)
-_UNSET = object()
-_VALID_ACKS = frozenset({0, 1, -1, "all"})
-_PRODUCER_POSITIVE_INT_CONFIGS = frozenset(
-    {
-        "connections_max_idle_ms",
-        "max_batch_size",
-        "max_in_flight_requests_per_connection",
-        "max_request_size",
-        "metadata_max_age_ms",
-        "request_timeout_ms",
-    }
-)
-_PRODUCER_NON_NEGATIVE_INT_CONFIGS = frozenset({"linger_ms", "retry_backoff_ms"})
 
 
-def _validate_int_config(
-    name: str,
-    value: object,
-    *,
-    minimum: int,
-) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"KafkaSink producer option {name} must be an integer >= {minimum}.")
-    if value < minimum:
-        raise ValueError(f"KafkaSink producer option {name} must be >= {minimum}.")
-    return value
-
-
-def _validate_producer_tuning(producer_kwargs: dict[str, Any]) -> None:
-    for name in sorted(_PRODUCER_POSITIVE_INT_CONFIGS):
-        if name in producer_kwargs:
-            _validate_int_config(name, producer_kwargs[name], minimum=1)
-    for name in sorted(_PRODUCER_NON_NEGATIVE_INT_CONFIGS):
-        if name in producer_kwargs:
-            _validate_int_config(name, producer_kwargs[name], minimum=0)
-    if "acks" in producer_kwargs and producer_kwargs["acks"] not in _VALID_ACKS:
-        raise ValueError("KafkaSink producer option acks must be one of 0, 1, -1, or 'all'.")
-    if "enable_idempotence" in producer_kwargs and not isinstance(
-        producer_kwargs["enable_idempotence"],
-        bool,
-    ):
-        raise TypeError("KafkaSink producer option enable_idempotence must be a bool.")
-
-
-@lru_cache(maxsize=1)
 def _producer_supported_kwargs() -> set[str] | None:
-    try:
-        parameters = signature(AIOKafkaProducer.__init__).parameters
-    except (TypeError, ValueError):  # pragma: no cover
-        return None
-    if any(parameter.kind is Parameter.VAR_KEYWORD for parameter in parameters.values()):
-        return None
-    return set(parameters)
+    return _producer_supported_kwargs_for(AIOKafkaProducer)
 
 
-@dataclass(frozen=True, slots=True)
-class KafkaSinkMessage:
-    """Per-record Kafka publish envelope."""
-
-    value: bytes | None | object = _UNSET
-    topic: str | object = _UNSET
-    key: bytes | None | object = _UNSET
-    partition: int | None | object = _UNSET
-    headers: Iterable[tuple[str, bytes]] | None | object = _UNSET
-    timestamp_ms: int | None | object = _UNSET
-
-
-@dataclass(frozen=True, slots=True)
-class _ResolvedKafkaSinkMessage:
-    topic: str
-    value: bytes
-    key: bytes | None
-    partition: int | None
-    headers: list[tuple[str, bytes]] | None
-    timestamp_ms: int | None
+_producer_supported_kwargs.cache_clear = _producer_supported_kwargs_for.cache_clear  # type: ignore[attr-defined]
 
 
 class KafkaSink(BaseSink[T], Generic[T]):
@@ -159,6 +108,11 @@ class KafkaSink(BaseSink[T], Generic[T]):
         self._security = self._resolve_security(security_protocol, security)
         self._security_protocol = (
             self._security.security_protocol if self._security is not None else security_protocol
+        )
+        warn_if_insecure_plaintext(
+            subject=type(self).__name__,
+            security_protocol=self._security_protocol,
+            bootstrap_servers=bootstrap_servers,
         )
         self._producer_kwargs = dict(producer_kwargs)
         self._producer_kwargs.setdefault("linger_ms", 5)
@@ -252,10 +206,6 @@ class KafkaSink(BaseSink[T], Generic[T]):
         if self._producer is None:
             raise RuntimeError("KafkaSink.open() was not called")
         try:
-            if self._transactional_id is not None and not self._in_transaction:
-                async with self.transaction():
-                    await self._enqueue_send(record)
-                return
             await self._enqueue_send(record)
         except KafkaError as exc:
             logger.exception("kafka_sink_send_error", topic=self._topic, error=str(exc))
@@ -263,7 +213,7 @@ class KafkaSink(BaseSink[T], Generic[T]):
 
     async def write_batch(self, records: list[T]) -> None:
         self._require_producer()
-        if self._transactional_id is not None and not self._in_transaction:
+        if self._transaction_per_batch and not self._in_transaction:
             async with self.transaction():
                 await self._write_batch_unwrapped(records)
             return
@@ -403,17 +353,61 @@ class KafkaSink(BaseSink[T], Generic[T]):
         if timestamp_ms is not None:
             send_kwargs["timestamp_ms"] = timestamp_ms
         send_kwargs["headers"] = self._tracing.inject_headers(headers)
-        with self._tracing.start_span(
-            "kafka.produce",
-            kind="producer",
-            attributes={
-                "messaging.system": "kafka",
-                "messaging.destination.name": topic,
-                "messaging.kafka.message.key_size": len(key) if key is not None else 0,
-                "messaging.message.body.size": len(value),
-            },
-        ):
-            return await producer.send(topic, **send_kwargs)
+
+        async def _issue_send() -> Any:
+            with self._tracing.start_span(
+                "kafka.produce",
+                kind="producer",
+                attributes={
+                    "messaging.system": "kafka",
+                    "messaging.destination.name": topic,
+                    "messaging.kafka.message.key_size": len(key) if key is not None else 0,
+                    "messaging.message.body.size": len(value),
+                },
+            ):
+                return await producer.send(topic, **send_kwargs)
+
+        delivery = await retry_async(
+            _issue_send,
+            policy=self._retry_policy,
+            on_retry=lambda attempt, exc, delay: logger.warning(
+                "kafka_sink_send_retry",
+                topic=topic,
+                attempt=attempt,
+                wait_s=delay,
+                error=str(exc),
+            ),
+        )
+        sink = self
+
+        class _DeliveryConfirmation:
+            def __await__(self) -> Any:
+                return self._confirm().__await__()
+
+            async def _confirm(self) -> Any:
+                try:
+                    return await delivery
+                except Exception as exc:
+                    if not sink._retry_policy.should_retry(exc, attempt=1):
+                        raise
+
+                    async def _send_and_confirm() -> Any:
+                        retry_delivery = await _issue_send()
+                        return await retry_delivery
+
+                    return await retry_async(
+                        _send_and_confirm,
+                        policy=sink._retry_policy,
+                        on_retry=lambda attempt, exc, delay: logger.warning(
+                            "kafka_sink_delivery_retry",
+                            topic=topic,
+                            attempt=attempt,
+                            wait_s=delay,
+                            error=str(exc),
+                        ),
+                    )
+
+        return _DeliveryConfirmation()
 
     async def wait_for_pending_acks(self) -> None:
         await self._drain_pending_acks()
@@ -576,14 +570,6 @@ class KafkaSink(BaseSink[T], Generic[T]):
         if self._producer is None:
             raise RuntimeError("KafkaSink.open() was not called")
         return self._producer
-
-
-def _coerce_headers(
-    headers: Iterable[tuple[str, bytes]] | None | object,
-) -> list[tuple[str, bytes]] | None:
-    if headers is None or headers is _UNSET:
-        return None
-    return list(cast("Iterable[tuple[str, bytes]]", headers))
 
 
 __all__ = ["KafkaSink", "KafkaSinkMessage"]

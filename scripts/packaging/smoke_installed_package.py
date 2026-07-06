@@ -6,17 +6,31 @@ import tomllib
 from importlib import import_module, metadata
 from pathlib import Path
 
-EXPECTED_EXTRAS = {"all", "anthropic", "cron", "distributed", "kafka", "postgres", "redis"}
+EXPECTED_EXTRAS = {
+    "all",
+    "anthropic",
+    "bigquery",
+    "cron",
+    "distributed",
+    "kafka",
+    "postgres",
+    "redis",
+    "s3",
+}
 EXPECTED_ENTRY_POINTS = {
     "agora.sources": {
+        "bigquery",
         "redis_stream",
         "redis_dlq_source",
         "kafka",
         "kafka_dlq_source",
         "postgres",
         "postgres_dlq_source",
+        "s3",
     },
     "agora.sinks": {
+        "bigquery",
+        "bigquery_storage_write",
         "redis",
         "redis_dlq",
         "kafka",
@@ -24,6 +38,7 @@ EXPECTED_ENTRY_POINTS = {
         "postgres",
         "postgres_schema_adapter",
         "postgres_dlq",
+        "s3",
     },
     "agora.ai.caches": {"redis"},
     "agora.ai.providers": {"anthropic"},
@@ -31,6 +46,11 @@ EXPECTED_ENTRY_POINTS = {
     "agora.state.backends": {"redis"},
 }
 EXPECTED_PUBLIC_IMPORTS = {
+    "agora_plugins.bigquery": [
+        "BigQuerySource",
+        "BigQuerySink",
+        "BigQueryStorageWriteSink",
+    ],
     "agora_plugins.kafka": [
         "KafkaSource",
         "KafkaSink",
@@ -59,11 +79,15 @@ EXPECTED_PUBLIC_IMPORTS = {
         "seconds_until_next_run",
         "validate_cron_expression",
     ],
+    "agora_plugins.s3": [
+        "S3Source",
+        "S3Sink",
+    ],
 }
 
 
 def _repo_metadata() -> tuple[str, str]:
-    pyproject = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
+    pyproject = tomllib.loads((Path(__file__).resolve().parents[2] / "pyproject.toml").read_text())
     project = pyproject["project"]
     version = str(project["version"])
     core_requirement = next(
@@ -76,7 +100,7 @@ def _repo_metadata() -> tuple[str, str]:
 
 
 def main() -> None:
-    source_package_dir = Path(__file__).resolve().parents[1] / "src" / "agora_plugins"
+    source_package_dir = Path(__file__).resolve().parents[2] / "src" / "agora_plugins"
     expected_version, expected_core_version = _repo_metadata()
     core_dist = metadata.distribution("agora-etl")
     core_version = core_dist.version

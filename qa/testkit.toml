@@ -1,0 +1,577 @@
+[defaults.env]
+PYTHONPATH = "src"
+INTEGRATION_REDIS_URL = "redis://127.0.0.1:16379/0"
+INTEGRATION_REDIS_SENTINEL_URL = "redis://127.0.0.1:16383/0"
+INTEGRATION_REDIS_CLUSTER_URL = "redis://127.0.0.1:16385/0"
+INTEGRATION_REDIS_STACK_URL = "redis://127.0.0.1:16388/0"
+INTEGRATION_REDIS_REDLOCK_URLS = "redis://127.0.0.1:16389/0,redis://127.0.0.1:16390/0,redis://127.0.0.1:16391/0"
+INTEGRATION_REDIS_SENTINEL_SOAK_CYCLES = "3"
+INTEGRATION_KAFKA_BOOTSTRAP = "127.0.0.1:19092"
+INTEGRATION_KAFKA_CLUSTER_BOOTSTRAP = "127.0.0.1:19192,127.0.0.1:19193,127.0.0.1:19194"
+INTEGRATION_KAFKA_CLUSTER_SOAK_CYCLES = "5"
+INTEGRATION_POSTGRES_HA_SOAK_CYCLES = "2"
+INTEGRATION_KAFKA_SCRAM_BOOTSTRAP = "127.0.0.1:19093"
+INTEGRATION_KAFKA_MTLS_BOOTSTRAP = "127.0.0.1:19094"
+INTEGRATION_POSTGRES_DSN = "postgresql://agora:agora@127.0.0.1:15432/agora_test"
+INTEGRATION_KAFKA_CLUSTER_POSTGRES_DSN = "postgresql://agora:agora@127.0.0.1:15433/agora_test"
+INTEGRATION_POSTGRES_HA_DSN = "postgresql://agora:agora@127.0.0.1:15435,127.0.0.1:15436/agora_test?target_session_attrs=read-write"
+INTEGRATION_S3_ENDPOINT_URL = "http://127.0.0.1:19000"
+INTEGRATION_S3_BUCKET = "agora-s3-test"
+INTEGRATION_S3_REGION = "us-east-1"
+INTEGRATION_BIGQUERY_LOCATION = "US"
+INTEGRATION_BIGQUERY_SOAK_CYCLES = "2"
+INTEGRATION_BIGQUERY_DENIED_DATASET = ""
+INTEGRATION_BIGQUERY_READONLY_TABLE = ""
+INTEGRATION_BIGQUERY_CREDENTIALS_PATH = ""
+
+[defaults]
+artifacts_dir = ".artifacts/testkit"
+
+[env_groups.base]
+AGORA_RUN_INTEGRATION = "1"
+AGORA_FAIL_ON_INTEGRATION_SKIP = "1"
+AGORA_TEST_REDIS_URL = "{INTEGRATION_REDIS_URL}"
+AGORA_TEST_KAFKA_BOOTSTRAP = "{INTEGRATION_KAFKA_BOOTSTRAP}"
+AGORA_TEST_POSTGRES_DSN = "{INTEGRATION_POSTGRES_DSN}"
+PYTHONPATH = "{PYTHONPATH}"
+
+[env_groups.kafka_cluster]
+AGORA_RUN_INTEGRATION = "1"
+AGORA_FAIL_ON_INTEGRATION_SKIP = "1"
+AGORA_TEST_ALLOW_DOCKER_CONTROL = "1"
+AGORA_TEST_KAFKA_CLUSTER_BOOTSTRAP = "{INTEGRATION_KAFKA_CLUSTER_BOOTSTRAP}"
+AGORA_TEST_POSTGRES_DSN = "{INTEGRATION_KAFKA_CLUSTER_POSTGRES_DSN}"
+PYTHONPATH = "{PYTHONPATH}"
+
+[env_groups.kafka_cluster_soak]
+AGORA_RUN_INTEGRATION = "1"
+AGORA_FAIL_ON_INTEGRATION_SKIP = "1"
+AGORA_TEST_ALLOW_DOCKER_CONTROL = "1"
+AGORA_TEST_KAFKA_CLUSTER_BOOTSTRAP = "{INTEGRATION_KAFKA_CLUSTER_BOOTSTRAP}"
+AGORA_TEST_POSTGRES_DSN = "{INTEGRATION_KAFKA_CLUSTER_POSTGRES_DSN}"
+AGORA_TEST_KAFKA_CLUSTER_SOAK_CYCLES = "{INTEGRATION_KAFKA_CLUSTER_SOAK_CYCLES}"
+PYTHONPATH = "{PYTHONPATH}"
+
+[env_groups.postgres_ha]
+AGORA_RUN_INTEGRATION = "1"
+AGORA_FAIL_ON_INTEGRATION_SKIP = "1"
+AGORA_TEST_ALLOW_DOCKER_CONTROL = "1"
+AGORA_TEST_POSTGRES_HA_DSN = "{INTEGRATION_POSTGRES_HA_DSN}"
+AGORA_TEST_POSTGRES_HA_SOAK_CYCLES = "{INTEGRATION_POSTGRES_HA_SOAK_CYCLES}"
+PYTHONPATH = "{PYTHONPATH}"
+
+[env_groups.kafka_postgres_ha]
+AGORA_RUN_INTEGRATION = "1"
+AGORA_FAIL_ON_INTEGRATION_SKIP = "1"
+AGORA_TEST_ALLOW_DOCKER_CONTROL = "1"
+AGORA_TEST_KAFKA_BOOTSTRAP = "{INTEGRATION_KAFKA_BOOTSTRAP}"
+AGORA_TEST_POSTGRES_DSN = "{INTEGRATION_POSTGRES_HA_DSN}"
+AGORA_TEST_POSTGRES_HA_DSN = "{INTEGRATION_POSTGRES_HA_DSN}"
+AGORA_TEST_POSTGRES_HA_SOAK_CYCLES = "{INTEGRATION_POSTGRES_HA_SOAK_CYCLES}"
+PYTHONPATH = "{PYTHONPATH}"
+
+[env_groups.kafka_secure]
+AGORA_RUN_INTEGRATION = "1"
+AGORA_FAIL_ON_INTEGRATION_SKIP = "1"
+AGORA_TEST_KAFKA_SCRAM_BOOTSTRAP = "{INTEGRATION_KAFKA_SCRAM_BOOTSTRAP}"
+AGORA_TEST_KAFKA_MTLS_BOOTSTRAP = "{INTEGRATION_KAFKA_MTLS_BOOTSTRAP}"
+AGORA_TEST_KAFKA_SCRAM_USERNAME = "agora"
+AGORA_TEST_KAFKA_SCRAM_PASSWORD_FILE = ".docker/kafka-secure/scram-password.txt"
+AGORA_TEST_KAFKA_CA_FILE = ".docker/kafka-secure/ca.crt"
+AGORA_TEST_KAFKA_CLIENT_CERT_FILE = ".docker/kafka-secure/client.crt"
+AGORA_TEST_KAFKA_CLIENT_KEY_FILE = ".docker/kafka-secure/client.key"
+AGORA_TEST_SCHEMA_REGISTRY_URL = "https://127.0.0.1:18081"
+AGORA_TEST_SCHEMA_REGISTRY_MTLS_URL = "https://127.0.0.1:18443"
+AGORA_TEST_SCHEMA_REGISTRY_USERNAME = "agora"
+AGORA_TEST_SCHEMA_REGISTRY_PASSWORD_FILE = ".docker/kafka-secure/schema-registry-password.txt"
+PYTHONPATH = "{PYTHONPATH}"
+
+[env_groups.redis_sentinel]
+AGORA_RUN_INTEGRATION = "1"
+AGORA_FAIL_ON_INTEGRATION_SKIP = "1"
+AGORA_TEST_ALLOW_DOCKER_CONTROL = "1"
+AGORA_TEST_REDIS_SENTINEL_URL = "{INTEGRATION_REDIS_SENTINEL_URL}"
+PYTHONPATH = "{PYTHONPATH}"
+
+[env_groups.redis_sentinel_soak]
+AGORA_RUN_INTEGRATION = "1"
+AGORA_FAIL_ON_INTEGRATION_SKIP = "1"
+AGORA_TEST_ALLOW_DOCKER_CONTROL = "1"
+AGORA_TEST_REDIS_SENTINEL_URL = "{INTEGRATION_REDIS_SENTINEL_URL}"
+AGORA_TEST_REDIS_SENTINEL_FAILOVER_CYCLES = "{INTEGRATION_REDIS_SENTINEL_SOAK_CYCLES}"
+PYTHONPATH = "{PYTHONPATH}"
+
+[env_groups.redis_enterprise]
+AGORA_RUN_INTEGRATION = "1"
+AGORA_FAIL_ON_INTEGRATION_SKIP = "1"
+AGORA_TEST_ALLOW_DOCKER_CONTROL = "1"
+AGORA_TEST_REDIS_SENTINEL_URL = "{INTEGRATION_REDIS_SENTINEL_URL}"
+AGORA_TEST_REDIS_CLUSTER_URL = "{INTEGRATION_REDIS_CLUSTER_URL}"
+AGORA_TEST_REDIS_STACK_URL = "{INTEGRATION_REDIS_STACK_URL}"
+PYTHONPATH = "{PYTHONPATH}"
+
+[env_groups.redis_redlock]
+AGORA_RUN_INTEGRATION = "1"
+AGORA_FAIL_ON_INTEGRATION_SKIP = "1"
+AGORA_TEST_REDIS_REDLOCK_URLS = "{INTEGRATION_REDIS_REDLOCK_URLS}"
+PYTHONPATH = "{PYTHONPATH}"
+
+[env_groups.redis_secure]
+AGORA_RUN_INTEGRATION = "1"
+AGORA_FAIL_ON_INTEGRATION_SKIP = "1"
+AGORA_TEST_REDIS_SECURE_HOST = "127.0.0.1"
+AGORA_TEST_REDIS_SECURE_PORT = "16384"
+AGORA_TEST_REDIS_SECURE_USERNAME = "agora"
+AGORA_TEST_REDIS_SECURE_PASSWORD_FILE = ".docker/redis-secure/password.txt"
+AGORA_TEST_REDIS_SECURE_CA_FILE = ".docker/redis-secure/ca.crt"
+AGORA_TEST_REDIS_SECURE_ROGUE_CA_FILE = ".docker/redis-secure/rogue-ca.crt"
+PYTHONPATH = "{PYTHONPATH}"
+
+[env_groups.s3]
+AGORA_RUN_INTEGRATION = "1"
+AGORA_FAIL_ON_INTEGRATION_SKIP = "1"
+AGORA_TEST_S3_ENDPOINT_URL = "{INTEGRATION_S3_ENDPOINT_URL}"
+AGORA_TEST_S3_ACCESS_KEY_ID = "minioadmin"
+AGORA_TEST_S3_SECRET_ACCESS_KEY = "minioadmin"
+AGORA_TEST_S3_BUCKET = "{INTEGRATION_S3_BUCKET}"
+AGORA_TEST_S3_REGION = "{INTEGRATION_S3_REGION}"
+PYTHONPATH = "{PYTHONPATH}"
+
+[env_groups.bigquery]
+AGORA_RUN_INTEGRATION = "1"
+AGORA_FAIL_ON_INTEGRATION_SKIP = "1"
+AGORA_TEST_BIGQUERY_PROJECT = "{INTEGRATION_BIGQUERY_PROJECT}"
+AGORA_TEST_BIGQUERY_LOCATION = "{INTEGRATION_BIGQUERY_LOCATION}"
+AGORA_TEST_BIGQUERY_DATASET = "{INTEGRATION_BIGQUERY_DATASET}"
+AGORA_TEST_BIGQUERY_DENIED_DATASET = "{INTEGRATION_BIGQUERY_DENIED_DATASET}"
+AGORA_TEST_BIGQUERY_READONLY_TABLE = "{INTEGRATION_BIGQUERY_READONLY_TABLE}"
+AGORA_TEST_BIGQUERY_SOAK_CYCLES = "{INTEGRATION_BIGQUERY_SOAK_CYCLES}"
+AGORA_TEST_BIGQUERY_CREDENTIALS_PATH = "{INTEGRATION_BIGQUERY_CREDENTIALS_PATH}"
+PYTHONPATH = "{PYTHONPATH}"
+
+[topologies.base]
+description = "Local Redis, Kafka, and Postgres integration stack"
+up = [
+  ["docker", "compose", "-f", "docker-compose.yaml", "up", "-d", "--wait"],
+]
+down = [
+  ["docker", "compose", "-f", "docker-compose.yaml", "down", "-v", "--remove-orphans"],
+]
+status = [
+  ["docker", "compose", "-f", "docker-compose.yaml", "ps"],
+]
+
+[topologies.kafka_cluster]
+description = "Three-broker Kafka cluster topology"
+up = [
+  ["docker", "compose", "-f", "docker-compose.kafka-cluster.yaml", "up", "-d", "--wait"],
+]
+down = [
+  ["docker", "compose", "-f", "docker-compose.kafka-cluster.yaml", "down", "-v", "--remove-orphans"],
+]
+status = [
+  ["docker", "compose", "-f", "docker-compose.kafka-cluster.yaml", "ps"],
+]
+
+[topologies.kafka_secure]
+description = "Secure Kafka and Schema Registry topology"
+up = [
+  ["{python}", "scripts/security/generate_assets.py", "kafka-secure"],
+  ["docker", "compose", "-f", "docker-compose.kafka-secure.yaml", "up", "-d", "--wait", "--force-recreate", "kafka-secure", "schema-registry", "schema-registry-secure"],
+  ["docker", "compose", "-f", "docker-compose.kafka-secure.yaml", "run", "--rm", "kafka-secure-init"],
+]
+down = [
+  ["docker", "compose", "-f", "docker-compose.kafka-secure.yaml", "down", "-v", "--remove-orphans"],
+]
+status = [
+  ["docker", "compose", "-f", "docker-compose.kafka-secure.yaml", "ps"],
+]
+
+[topologies.postgres_ha]
+description = "Postgres HA failover topology"
+up = [
+  ["docker", "compose", "-f", "docker-compose.postgres-ha.yaml", "up", "-d", "--wait"],
+]
+down = [
+  ["docker", "compose", "-f", "docker-compose.postgres-ha.yaml", "down", "-v", "--remove-orphans"],
+]
+status = [
+  ["docker", "compose", "-f", "docker-compose.postgres-ha.yaml", "ps"],
+]
+
+[topologies.redis_sentinel]
+description = "Redis Sentinel failover topology"
+up = [
+  ["docker", "compose", "-f", "docker-compose.redis-sentinel.yaml", "up", "-d", "--wait"],
+]
+down = [
+  ["docker", "compose", "-f", "docker-compose.redis-sentinel.yaml", "down", "-v"],
+]
+status = [
+  ["docker", "compose", "-f", "docker-compose.redis-sentinel.yaml", "ps"],
+]
+
+[topologies.redis_secure]
+description = "Redis TLS and ACL topology"
+up = [
+  ["{python}", "scripts/security/generate_assets.py", "redis-secure"],
+  ["docker", "compose", "-f", "docker-compose.redis-secure.yaml", "up", "-d", "--wait"],
+]
+down = [
+  ["docker", "compose", "-f", "docker-compose.redis-secure.yaml", "down", "-v"],
+]
+status = [
+  ["docker", "compose", "-f", "docker-compose.redis-secure.yaml", "ps"],
+]
+
+[topologies.redis_cluster]
+description = "Redis Cluster topology"
+up = [
+  ["docker", "compose", "-f", "docker-compose.redis-cluster.yaml", "up", "-d", "--wait"],
+]
+down = [
+  ["docker", "compose", "-f", "docker-compose.redis-cluster.yaml", "down", "-v"],
+]
+status = [
+  ["docker", "compose", "-f", "docker-compose.redis-cluster.yaml", "ps"],
+]
+
+[topologies.redis_stack]
+description = "Redis Stack with RediSearch"
+up = [
+  ["docker", "compose", "-f", "docker-compose.redis-stack.yaml", "up", "-d", "--wait"],
+]
+down = [
+  ["docker", "compose", "-f", "docker-compose.redis-stack.yaml", "down", "-v"],
+]
+status = [
+  ["docker", "compose", "-f", "docker-compose.redis-stack.yaml", "ps"],
+]
+
+[topologies.s3]
+description = "MinIO-backed S3 topology"
+up = [
+  ["docker", "compose", "-f", "docker-compose.s3-minio.yaml", "up", "-d", "minio"],
+  ["docker", "compose", "-f", "docker-compose.s3-minio.yaml", "run", "--rm", "minio-init"],
+]
+down = [
+  ["docker", "compose", "-f", "docker-compose.s3-minio.yaml", "down", "-v", "--remove-orphans"],
+]
+status = [
+  ["docker", "compose", "-f", "docker-compose.s3-minio.yaml", "ps"],
+]
+
+[topologies.redis_redlock]
+description = "Three independent Redis masters for Redlock tests"
+up = [
+  ["docker", "compose", "-f", "docker-compose.redis-redlock.yaml", "up", "-d", "--wait"],
+]
+down = [
+  ["docker", "compose", "-f", "docker-compose.redis-redlock.yaml", "down", "-v"],
+]
+status = [
+  ["docker", "compose", "-f", "docker-compose.redis-redlock.yaml", "ps"],
+]
+
+[suites.integration_full]
+description = "Run the broad integration suite against the base stack"
+env_group = "base"
+topologies = ["base"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration", "-q"],
+]
+
+[suites.kafka_redis_wedge]
+description = "Kafka to Redis wedge slice"
+env_group = "base"
+topologies = ["base"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/test_kafka_redis_wedge.py", "-q", "-vv", "-rs", "-s"],
+]
+
+[suites.kafka_secure]
+description = "Secure Kafka and Schema Registry integration tests"
+env_group = "kafka_secure"
+topologies = ["kafka_secure"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/kafka/test_kafka_secure_integration.py", "-q"],
+]
+
+[suites.kafka_secure_schema_failure_matrix]
+description = "Secure Kafka schema failure-path matrix"
+env_group = "kafka_secure"
+topologies = ["kafka_secure"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/kafka/test_kafka_secure_integration.py", "-k", "json_schema_failure_path or protobuf_failure_path", "-q", "-vv", "-rs", "-s"],
+]
+
+[suites.postgres_ha_failover]
+description = "Postgres HA failover reconnect and resume slice"
+env_group = "postgres_ha"
+topologies = ["base", "postgres_ha"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/postgres/test_postgres_integration.py", "-k", "ha_failover", "-q", "-vv", "-rs", "-s"],
+]
+
+[suites.postgres_ha_replica_routing]
+description = "Postgres HA replica routing and staleness guard slice"
+env_group = "postgres_ha"
+topologies = ["base", "postgres_ha"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/postgres/test_postgres_integration.py", "-k", "standby_route_fail_closes_when_replica_is_stale or prefer_standby_falls_back_to_primary_across_multi_cycle_failover", "-q", "-vv", "-rs", "-s"],
+]
+
+[suites.kafka_postgres_ha_failover]
+description = "Kafka to Postgres HA failover wedge slice"
+env_group = "kafka_postgres_ha"
+topologies = ["base", "postgres_ha"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/test_kafka_postgres_wedge.py", "-k", "postgres_failover", "-q", "-vv", "-rs", "-s"],
+]
+
+[suites.s3_integration]
+description = "MinIO-backed S3 dataset integration tests"
+env_group = "s3"
+topologies = ["s3"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/s3/test_s3_integration.py", "-q"],
+]
+
+[suites.bigquery_live]
+description = "BigQuery live IAM, checkpoint, and recovery tests"
+env_group = "bigquery"
+required_env = ["INTEGRATION_BIGQUERY_PROJECT", "INTEGRATION_BIGQUERY_DATASET"]
+commands = [
+  [".venv/bin/pytest", "tests/integration/bigquery/test_bigquery_live_integration.py", "-q", "-vv", "-rs"],
+]
+
+[suites.bigquery_storage_write_live]
+description = "BigQuery Storage Write live tests"
+env_group = "bigquery"
+required_env = ["INTEGRATION_BIGQUERY_PROJECT", "INTEGRATION_BIGQUERY_DATASET"]
+commands = [
+  [".venv/bin/pytest", "tests/integration/bigquery/test_bigquery_storage_write_live_integration.py", "-q", "-vv", "-rs"],
+]
+
+[suites.bigquery_enterprise]
+description = "BigQuery enterprise verification slice"
+env_group = "bigquery"
+required_env = ["INTEGRATION_BIGQUERY_PROJECT", "INTEGRATION_BIGQUERY_DATASET"]
+commands = [
+  [".venv/bin/pytest", "tests/integration/bigquery/test_bigquery_live_integration.py", "-q", "-vv", "-rs"],
+  [".venv/bin/pytest", "tests/integration/bigquery/test_bigquery_storage_write_live_integration.py", "-q", "-vv", "-rs"],
+]
+
+[suites.redis_sentinel]
+description = "Redis Sentinel failover semantics"
+env_group = "redis_sentinel"
+topologies = ["redis_sentinel"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/redis/test_redis_sentinel_integration.py", "-k", "not multi_cycle", "-q", "-vv", "-rs", "-s"],
+]
+
+[suites.redis_sentinel_crash]
+description = "Redis Sentinel crash-failover reconnect semantics"
+env_group = "redis_sentinel"
+topologies = ["redis_sentinel"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/redis/test_redis_sentinel_integration.py", "-k", "crash and not multi_cycle", "-q", "-vv", "-rs", "-s"],
+]
+
+[suites.redis_sentinel_graceful]
+description = "Redis Sentinel graceful-failover reclaim semantics"
+env_group = "redis_sentinel"
+topologies = ["redis_sentinel"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/redis/test_redis_sentinel_integration.py", "-k", "graceful and not multi_cycle", "-q", "-vv", "-rs", "-s"],
+]
+
+[suites.redis_sentinel_soak]
+description = "Redis Sentinel multi-cycle failover soak slice"
+env_group = "redis_sentinel_soak"
+topologies = ["redis_sentinel"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/redis/test_redis_sentinel_integration.py", "-k", "multi_cycle", "-q", "-vv", "-rs", "-s"],
+]
+
+[suites.redis_sentinel_crash_soak]
+description = "Redis Sentinel multi-cycle crash-failover soak slice"
+env_group = "redis_sentinel_soak"
+topologies = ["redis_sentinel"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/redis/test_redis_sentinel_integration.py", "-k", "crash and multi_cycle", "-q", "-vv", "-rs", "-s"],
+]
+
+[suites.redis_sentinel_graceful_soak]
+description = "Redis Sentinel multi-cycle graceful-failover soak slice"
+env_group = "redis_sentinel_soak"
+topologies = ["redis_sentinel"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/redis/test_redis_sentinel_integration.py", "-k", "graceful and multi_cycle", "-q", "-vv", "-rs", "-s"],
+]
+
+[suites.redis_secure_matrix]
+description = "Redis TLS and ACL auth-failure matrix"
+env_group = "redis_secure"
+topologies = ["redis_secure"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/redis/test_redis_secure_integration.py", "-q", "-vv", "-rs", "-s"],
+]
+
+[suites.redis_enterprise_matrix]
+description = "Redis Sentinel, Cluster, and RediSearch enterprise matrix"
+env_group = "redis_enterprise"
+topologies = ["redis_sentinel", "redis_cluster", "redis_stack"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/redis/test_redis_enterprise_matrix.py", "-q", "-vv", "-rs", "-s"],
+]
+
+[suites.redis_redlock]
+description = "Distributed coordinator Redlock quorum topology tests"
+env_group = "redis_redlock"
+topologies = ["redis_redlock"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/test_distributed_integration.py", "-k", "redlock", "-q", "-vv", "-rs", "-s"],
+]
+
+[suites.kafka_cluster_failover]
+description = "Kafka multi-broker leader-failover wedge test"
+env_group = "kafka_cluster"
+topologies = ["kafka_cluster"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/test_kafka_postgres_wedge.py", "-k", "leader_failover or rolling_restart or coordinator_failover", "-q", "-vv", "-rs", "-s"],
+]
+
+[suites.kafka_cluster_enterprise]
+description = "Kafka enterprise cluster regression slice"
+env_group = "kafka_cluster"
+topologies = ["kafka_cluster"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/test_kafka_postgres_wedge.py", "-k", "leader_failover or rolling_restart or coordinator_failover or crash_windows_survive_multi_broker_rolling_restart or crash_windows_survive_coordinator_failover or seek_to_offsets_partial_replay_survives_multi_broker_rolling_restart or live_tail_after_seek_to_end_survives_multi_broker_rolling_restart", "-q", "-vv", "-rs", "-s"],
+]
+
+[suites.kafka_cluster_enterprise_soak]
+description = "Kafka enterprise cluster soak slice with repeated restart cycles"
+env_group = "kafka_cluster_soak"
+topologies = ["kafka_cluster"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/test_kafka_postgres_wedge.py", "-k", "rolling_restart or seek_to_offsets_partial_replay_survives_multi_broker_rolling_restart or live_tail_after_seek_to_end_survives_multi_broker_rolling_restart", "-q", "-vv", "-rs", "-s"],
+]
+
+[suites.kafka_secure_enterprise_matrix]
+description = "Secure Kafka and Schema Registry compatibility matrix"
+env_group = "kafka_secure"
+topologies = ["kafka_secure"]
+topology_policy = "recreate"
+commands = [
+  [".venv/bin/pytest", "tests/integration/kafka/test_kafka_secure_integration.py", "-k", "avro_round_trip or avro_round_trip_over_secure_schema_registry_mtls or json_schema_round_trip or json_schema_failure_path or protobuf_round_trip or protobuf_failure_path or schema_registry_mtls_rejects_client_without_certificate or schema_registry_mtls_rejects_client_with_untrusted_certificate or schema_registry_auth_failures_are_rejected_clearly", "-q", "-vv", "-rs", "-s"],
+]
+
+[suites.wheel_release_gate]
+description = "Installed wheel and import consistency gate"
+commands = [
+  ["make", "test-release-gate-wheel"],
+]
+
+[gates.release_base]
+description = "Base Kafka and Redis release gate"
+suites = ["kafka_redis_wedge"]
+
+[gates.release_postgres]
+description = "Postgres HA and Kafka/Postgres release gate"
+suites = ["postgres_ha_failover", "postgres_ha_replica_routing", "kafka_postgres_ha_failover"]
+
+[gates.release_kafka_secure]
+description = "Secure Kafka and Schema Registry release gate"
+suites = ["kafka_secure_enterprise_matrix"]
+
+[gates.release_kafka_cluster]
+description = "Kafka cluster failover and replay release gate"
+suites = ["kafka_cluster_enterprise"]
+
+[gates.release_redis]
+description = "Redis secure, enterprise topology, and Redlock release gate"
+suites = ["redis_secure_matrix", "redis_enterprise_matrix", "redis_redlock"]
+
+[gates.release_bigquery]
+description = "BigQuery dataset and Storage Write release gate"
+suites = ["bigquery_enterprise"]
+
+[gates.release_s3]
+description = "S3 dataset release gate"
+suites = ["s3_integration"]
+
+[matrices.periodic]
+description = "Nightly periodic integration matrix"
+lanes = ["wheel", "base", "postgres", "kafka-secure", "kafka-cluster", "s3", "bigquery", "redis-secure", "redis-enterprise", "redis-redlock"]
+
+[matrix_lanes.periodic.wheel]
+label = "Wheel/import consistency gate"
+kind = "suite"
+target = "wheel_release_gate"
+
+[matrix_lanes.periodic.base]
+label = "Base Kafka/Redis/Postgres stack gate"
+kind = "gate"
+target = "release_base"
+
+[matrix_lanes.periodic.postgres]
+label = "Postgres HA + Kafka/Postgres wedge gate"
+kind = "gate"
+target = "release_postgres"
+
+[matrix_lanes.periodic.kafka-secure]
+label = "Secure Kafka/schema-registry gate"
+kind = "gate"
+target = "release_kafka_secure"
+
+[matrix_lanes.periodic.kafka-cluster]
+label = "Kafka cluster failover/replay gate"
+kind = "gate"
+target = "release_kafka_cluster"
+
+[matrix_lanes.periodic.s3]
+label = "S3 dataset MinIO gate"
+kind = "gate"
+target = "release_s3"
+
+[matrix_lanes.periodic.bigquery]
+label = "BigQuery local GA dataset + Storage Write gate"
+kind = "gate"
+target = "release_bigquery"
+skip_if_missing_env = ["INTEGRATION_BIGQUERY_PROJECT", "INTEGRATION_BIGQUERY_DATASET"]
+
+[matrix_lanes.periodic.redis-secure]
+label = "Redis secure gate"
+kind = "suite"
+target = "redis_secure_matrix"
+
+[matrix_lanes.periodic.redis-enterprise]
+label = "Redis enterprise topology gate"
+kind = "suite"
+target = "redis_enterprise_matrix"
+
+[matrix_lanes.periodic.redis-redlock]
+label = "Redis Redlock quorum gate"
+kind = "suite"
+target = "redis_redlock"

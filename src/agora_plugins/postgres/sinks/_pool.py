@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Protocol
 
 import logstruct
 
@@ -20,31 +19,31 @@ class PostgresPoolOwner(Protocol):
 
     _table: str | QuotedIdentifier
     _connection: PostgresConnectionConfig
-    _conn: Any | None
+    _conn: object | None
     _pool_size: int
     _pool_acquire_timeout_s: float | None
     _pool_health_check: bool
     _pool_max_lifetime_s: float
     _pool_max_idle_s: float
-    _write_pool: asyncio.LifoQueue[Any] | None
+    _write_pool: asyncio.LifoQueue[object] | None
     _write_pool_open_connections: int
     _write_pool_lock: asyncio.Lock
-    _external_write_pool: Any | None
+    _external_write_pool: object | None
     _external_write_pool_conn_ids: set[int]
     _external_write_pool_unavailable: bool
 
-    async def _get_conn(self) -> Any: ...
+    async def _get_conn(self) -> object: ...
 
-    async def _create_connection(self) -> Any: ...
+    async def _create_connection(self) -> object: ...
 
-    async def _pooled_connection_ready(self, conn: Any) -> bool: ...
+    async def _pooled_connection_ready(self, conn: object) -> bool: ...
 
-    async def _discard_pooled_connection(self, conn: Any) -> None: ...
+    async def _discard_pooled_connection(self, conn: object) -> None: ...
 
-    async def _acquire_write_conn(self) -> tuple[Any, bool]: ...
+    async def _acquire_write_conn(self) -> tuple[object, bool]: ...
 
 
-async def acquire_write_conn(owner: PostgresPoolOwner) -> tuple[Any, bool]:
+async def acquire_write_conn(owner: PostgresPoolOwner) -> tuple[object, bool]:
     if owner._pool_size <= 1:
         return await owner._get_conn(), False
 
@@ -107,7 +106,7 @@ async def acquire_write_conn(owner: PostgresPoolOwner) -> tuple[Any, bool]:
     return await owner._acquire_write_conn()
 
 
-async def pooled_connection_ready(owner: PostgresPoolOwner, conn: Any) -> bool:
+async def pooled_connection_ready(owner: PostgresPoolOwner, conn: object) -> bool:
     if not owner._pool_health_check:
         return True
     try:
@@ -119,11 +118,9 @@ async def pooled_connection_ready(owner: PostgresPoolOwner, conn: Any) -> bool:
         return False
 
 
-async def discard_pooled_connection(owner: PostgresPoolOwner, conn: Any) -> None:
+async def discard_pooled_connection(owner: PostgresPoolOwner, conn: object) -> None:
     try:
-        await conn.close()
-    except Exception:
-        pass
+        await close_connection_best_effort(owner, conn, reason="discard")
     finally:
         async with owner._write_pool_lock:
             owner._write_pool_open_connections = max(
@@ -134,7 +131,7 @@ async def discard_pooled_connection(owner: PostgresPoolOwner, conn: Any) -> None
 
 async def release_write_conn(
     owner: PostgresPoolOwner,
-    conn: Any,
+    conn: object,
     *,
     pooled: bool,
     discard: bool = False,
@@ -142,9 +139,7 @@ async def release_write_conn(
     if not pooled:
         if discard and owner._conn is conn:
             try:
-                await cast("Any", conn).close()
-            except Exception:
-                pass
+                await close_connection_best_effort(owner, conn, reason="single_connection_discard")
             finally:
                 owner._conn = None
         return
@@ -152,17 +147,14 @@ async def release_write_conn(
     if id(conn) in owner._external_write_pool_conn_ids and owner._external_write_pool is not None:
         owner._external_write_pool_conn_ids.discard(id(conn))
         if discard:
-            with suppress(Exception):
-                await conn.close()
+            await close_connection_best_effort(owner, conn, reason="external_pool_discard")
         await owner._external_write_pool.putconn(conn)
         owner._write_pool_open_connections = len(owner._external_write_pool_conn_ids)
         return
 
     if discard:
         try:
-            await conn.close()
-        except Exception:
-            pass
+            await close_connection_best_effort(owner, conn, reason="pool_discard")
         finally:
             async with owner._write_pool_lock:
                 owner._write_pool_open_connections = max(
@@ -175,7 +167,24 @@ async def release_write_conn(
     owner._write_pool.put_nowait(conn)
 
 
-async def ensure_external_write_pool(owner: PostgresPoolOwner) -> Any | None:
+async def close_connection_best_effort(
+    owner: PostgresPoolOwner,
+    conn: object,
+    *,
+    reason: str,
+) -> None:
+    try:
+        await conn.close()
+    except Exception as exc:
+        logger.debug(
+            "postgres_sink_connection_close_error",
+            table=owner._table,
+            reason=reason,
+            error=str(exc),
+        )
+
+
+async def ensure_external_write_pool(owner: PostgresPoolOwner) -> object | None:
     if owner._external_write_pool_unavailable:
         return None
     if owner._external_write_pool is not None:

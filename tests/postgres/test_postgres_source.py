@@ -9,9 +9,9 @@ from agora import (
     Checkpoint,
     DeliveryConfig,
     Pipeline,
-    SourceRecordError,
     SourceRecordFailurePolicy,
 )
+from agora.core.source import SourceRecordError
 
 from agora_plugins.postgres import (
     PostgresAuthConfig,

@@ -8,6 +8,7 @@ import pytest
 from agora.core.dlq import DLQRecord
 
 from agora_plugins.redis import RedisBackend, RedisDLQSink, RedisEmbeddingStore, RedisSink
+from agora_plugins.redis.connection import build_sync_redis_client
 
 pytestmark = pytest.mark.integration
 _INTEGRATION_TIMEOUT_S = 20.0
@@ -115,11 +116,12 @@ async def test_redis_cluster_sink_batches_without_cross_slot_mset(
     redis_cluster_url: str,
     unique_suffix: str,
 ) -> None:
-    redis = pytest.importorskip("redis")
-    client = redis.RedisCluster.from_url(
-        redis_cluster_url,
+    pytest.importorskip("redis")
+    client = build_sync_redis_client(
+        url=redis_cluster_url,
         decode_responses=True,
-        address_remap=_redis_cluster_address_remap,
+        redis_cluster=True,
+        redis_cluster_address_remap=_redis_cluster_address_remap,
     )
     keys = [
         f"agora:it:cluster:{unique_suffix}:alpha",
@@ -158,7 +160,7 @@ def test_redis_cluster_backend_delete_prefix_deletes_cross_slot_keys(
     redis_cluster_url: str,
     unique_suffix: str,
 ) -> None:
-    redis = pytest.importorskip("redis")
+    pytest.importorskip("redis")
     prefix = f"agora:it:cluster-state:{unique_suffix}:"
     backend = RedisBackend(
         url=redis_cluster_url,
@@ -166,10 +168,11 @@ def test_redis_cluster_backend_delete_prefix_deletes_cross_slot_keys(
         redis_cluster=True,
         redis_cluster_address_remap=_redis_cluster_address_remap,
     )
-    client = redis.RedisCluster.from_url(
-        redis_cluster_url,
+    client = build_sync_redis_client(
+        url=redis_cluster_url,
         decode_responses=True,
-        address_remap=_redis_cluster_address_remap,
+        redis_cluster=True,
+        redis_cluster_address_remap=_redis_cluster_address_remap,
     )
     keys = [f"item:{name}" for name in ("alpha", "bravo", "charlie")]
 
@@ -245,13 +248,14 @@ async def test_redis_cluster_embedding_store_handles_cross_slot_index_and_fields
     redis_cluster_url: str,
     unique_suffix: str,
 ) -> None:
-    redis = pytest.importorskip("redis")
+    pytest.importorskip("redis")
     prefix = f"agora:it:cluster-emb:{unique_suffix}:"
     index_key = f"{prefix}__index__"
-    client = redis.RedisCluster.from_url(
-        redis_cluster_url,
+    client = build_sync_redis_client(
+        url=redis_cluster_url,
         decode_responses=True,
-        address_remap=_redis_cluster_address_remap,
+        redis_cluster=True,
+        redis_cluster_address_remap=_redis_cluster_address_remap,
     )
     store = RedisEmbeddingStore(
         provider=_MatrixEmbeddingProvider(),

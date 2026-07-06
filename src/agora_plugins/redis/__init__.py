@@ -9,6 +9,8 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
+from agora_plugins._surface_manifest import SurfaceExport, export_target_map
+
 if TYPE_CHECKING:
     from agora_plugins.redis.ai import RedisLLMCache
     from agora_plugins.redis.dedup.stores import RedisEmbeddingStore, RedisStore
@@ -92,107 +94,313 @@ __all__ = [
     "wrap_kafka_redis_deserializer",
 ]
 
-_EXPORTS: dict[str, tuple[str, str]] = {
-    "KafkaRedisDeliveryConfig": ("agora_plugins.redis.kafka", "KafkaRedisDeliveryConfig"),
-    "KafkaRedisEnterpriseAcceptanceFinding": (
+_STABLE_PUBLIC_EXPORTS = frozenset(
+    {
+        "MANIFEST",
+        "PluginManifest",
+        "RedisBackend",
+        "RedisDLQSink",
+        "RedisDLQSource",
+        "RedisEmbeddingStore",
+        "RedisLLMCache",
+        "RedisSink",
+        "RedisStore",
+        "RedisStreamSource",
+    }
+)
+
+_SUPPORTABILITY_PUBLIC_EXPORTS = frozenset(
+    {
+        "RedisDLQSinkEnterpriseAcceptanceThresholds",
+        "RedisDLQSinkMetricsSnapshot",
+        "RedisDLQSourceEnterpriseAcceptanceThresholds",
+        "RedisDLQSourceMetricsSnapshot",
+        "RedisEnterpriseAcceptanceFinding",
+        "RedisEnterpriseAcceptanceGate",
+        "RedisEnterpriseAcceptanceReport",
+        "RedisPrometheusExporter",
+        "RedisSinkEnterpriseAcceptanceThresholds",
+        "RedisSinkMetricsSnapshot",
+        "RedisSourceEnterpriseAcceptanceThresholds",
+        "RedisSourcePoisonLoopRiskSnapshot",
+        "RedisStreamSourceHealthSnapshot",
+        "RedisStreamSourceMetricsSnapshot",
+    }
+)
+
+_PATTERN_RECIPE_EXPORTS = frozenset(
+    {
+        "KafkaRedisDeliveryConfig",
+        "KafkaRedisEnterpriseAcceptanceFinding",
+        "KafkaRedisEnterpriseAcceptanceGate",
+        "KafkaRedisEnterpriseAcceptanceReport",
+        "KafkaRedisEnterpriseAcceptanceThresholds",
+        "KafkaRedisEnvelopeDeserializer",
+        "KafkaRedisPrometheusExporter",
+        "KafkaRedisRuntime",
+        "KafkaRedisRuntimeHealthSnapshot",
+        "KafkaRedisRuntimeMetricsSnapshot",
+        "KafkaRedisStorageConfig",
+        "build_kafka_redis_runtime",
+        "build_kafka_redis_sink",
+        "build_kafka_redis_source",
+        "wrap_kafka_redis_deserializer",
+    }
+)
+
+_INTERNAL_BRIDGE_EXPORTS = frozenset({"_doctor_readiness_provider"})
+
+
+def _surface_note(name: str) -> str:
+    if name in _STABLE_PUBLIC_EXPORTS:
+        return "Stable Redis family primitive/cache/state public surface."
+    if name in _SUPPORTABILITY_PUBLIC_EXPORTS:
+        return "Redis supportability, diagnostics, or observability public surface."
+    return "Redis composite Kafka wedge or pattern-oriented helper surface."
+
+
+_SURFACE_EXPORTS: dict[str, SurfaceExport] = {
+    "MANIFEST": SurfaceExport(
+        "agora_plugins.redis.plugin",
+        "MANIFEST",
+        "stable_public",
+        _surface_note("MANIFEST"),
+    ),
+    "KafkaRedisDeliveryConfig": SurfaceExport(
+        "agora_plugins.redis.kafka",
+        "KafkaRedisDeliveryConfig",
+        "pattern_recipe",
+        _surface_note("KafkaRedisDeliveryConfig"),
+    ),
+    "KafkaRedisEnterpriseAcceptanceFinding": SurfaceExport(
         "agora_plugins.redis.kafka",
         "KafkaRedisEnterpriseAcceptanceFinding",
+        "pattern_recipe",
+        _surface_note("KafkaRedisEnterpriseAcceptanceFinding"),
     ),
-    "KafkaRedisEnterpriseAcceptanceGate": (
+    "KafkaRedisEnterpriseAcceptanceGate": SurfaceExport(
         "agora_plugins.redis.kafka",
         "KafkaRedisEnterpriseAcceptanceGate",
+        "pattern_recipe",
+        _surface_note("KafkaRedisEnterpriseAcceptanceGate"),
     ),
-    "KafkaRedisEnterpriseAcceptanceReport": (
+    "KafkaRedisEnterpriseAcceptanceReport": SurfaceExport(
         "agora_plugins.redis.kafka",
         "KafkaRedisEnterpriseAcceptanceReport",
+        "pattern_recipe",
+        _surface_note("KafkaRedisEnterpriseAcceptanceReport"),
     ),
-    "KafkaRedisEnterpriseAcceptanceThresholds": (
+    "KafkaRedisEnterpriseAcceptanceThresholds": SurfaceExport(
         "agora_plugins.redis.kafka",
         "KafkaRedisEnterpriseAcceptanceThresholds",
+        "pattern_recipe",
+        _surface_note("KafkaRedisEnterpriseAcceptanceThresholds"),
     ),
-    "KafkaRedisEnvelopeDeserializer": (
+    "KafkaRedisEnvelopeDeserializer": SurfaceExport(
         "agora_plugins.redis.kafka",
         "KafkaRedisEnvelopeDeserializer",
+        "pattern_recipe",
+        _surface_note("KafkaRedisEnvelopeDeserializer"),
     ),
-    "KafkaRedisPrometheusExporter": ("agora_plugins.redis.kafka", "KafkaRedisPrometheusExporter"),
-    "KafkaRedisRuntime": ("agora_plugins.redis.kafka", "KafkaRedisRuntime"),
-    "KafkaRedisRuntimeHealthSnapshot": (
+    "KafkaRedisPrometheusExporter": SurfaceExport(
+        "agora_plugins.redis.kafka",
+        "KafkaRedisPrometheusExporter",
+        "pattern_recipe",
+        _surface_note("KafkaRedisPrometheusExporter"),
+    ),
+    "KafkaRedisRuntime": SurfaceExport(
+        "agora_plugins.redis.kafka",
+        "KafkaRedisRuntime",
+        "pattern_recipe",
+        _surface_note("KafkaRedisRuntime"),
+    ),
+    "KafkaRedisRuntimeHealthSnapshot": SurfaceExport(
         "agora_plugins.redis.kafka",
         "KafkaRedisRuntimeHealthSnapshot",
+        "pattern_recipe",
+        _surface_note("KafkaRedisRuntimeHealthSnapshot"),
     ),
-    "KafkaRedisRuntimeMetricsSnapshot": (
+    "KafkaRedisRuntimeMetricsSnapshot": SurfaceExport(
         "agora_plugins.redis.kafka",
         "KafkaRedisRuntimeMetricsSnapshot",
+        "pattern_recipe",
+        _surface_note("KafkaRedisRuntimeMetricsSnapshot"),
     ),
-    "KafkaRedisStorageConfig": ("agora_plugins.redis.kafka", "KafkaRedisStorageConfig"),
-    "MANIFEST": ("agora_plugins.redis.plugin", "MANIFEST"),
-    "PluginManifest": ("agora_plugins.redis.plugin", "PluginManifest"),
-    "RedisBackend": ("agora_plugins.redis.state", "RedisBackend"),
-    "RedisDLQSinkEnterpriseAcceptanceThresholds": (
+    "KafkaRedisStorageConfig": SurfaceExport(
+        "agora_plugins.redis.kafka",
+        "KafkaRedisStorageConfig",
+        "pattern_recipe",
+        _surface_note("KafkaRedisStorageConfig"),
+    ),
+    "PluginManifest": SurfaceExport(
+        "agora_plugins.redis.plugin",
+        "PluginManifest",
+        "stable_public",
+        _surface_note("PluginManifest"),
+    ),
+    "RedisBackend": SurfaceExport(
+        "agora_plugins.redis.state",
+        "RedisBackend",
+        "stable_public",
+        _surface_note("RedisBackend"),
+    ),
+    "RedisDLQSink": SurfaceExport(
+        "agora_plugins.redis.dlq",
+        "RedisDLQSink",
+        "stable_public",
+        _surface_note("RedisDLQSink"),
+    ),
+    "RedisDLQSinkEnterpriseAcceptanceThresholds": SurfaceExport(
         "agora_plugins.redis.observability",
         "RedisDLQSinkEnterpriseAcceptanceThresholds",
+        "supportability_public",
+        _surface_note("RedisDLQSinkEnterpriseAcceptanceThresholds"),
     ),
-    "RedisDLQSinkMetricsSnapshot": (
+    "RedisDLQSinkMetricsSnapshot": SurfaceExport(
         "agora_plugins.redis.observability",
         "RedisDLQSinkMetricsSnapshot",
+        "supportability_public",
+        _surface_note("RedisDLQSinkMetricsSnapshot"),
     ),
-    "RedisDLQSink": ("agora_plugins.redis.dlq", "RedisDLQSink"),
-    "RedisDLQSourceEnterpriseAcceptanceThresholds": (
+    "RedisDLQSource": SurfaceExport(
+        "agora_plugins.redis.dlq",
+        "RedisDLQSource",
+        "stable_public",
+        _surface_note("RedisDLQSource"),
+    ),
+    "RedisDLQSourceEnterpriseAcceptanceThresholds": SurfaceExport(
         "agora_plugins.redis.observability",
         "RedisDLQSourceEnterpriseAcceptanceThresholds",
+        "supportability_public",
+        _surface_note("RedisDLQSourceEnterpriseAcceptanceThresholds"),
     ),
-    "RedisDLQSourceMetricsSnapshot": (
+    "RedisDLQSourceMetricsSnapshot": SurfaceExport(
         "agora_plugins.redis.observability",
         "RedisDLQSourceMetricsSnapshot",
+        "supportability_public",
+        _surface_note("RedisDLQSourceMetricsSnapshot"),
     ),
-    "RedisDLQSource": ("agora_plugins.redis.dlq", "RedisDLQSource"),
-    "RedisEnterpriseAcceptanceFinding": (
+    "RedisEmbeddingStore": SurfaceExport(
+        "agora_plugins.redis.dedup.stores",
+        "RedisEmbeddingStore",
+        "stable_public",
+        _surface_note("RedisEmbeddingStore"),
+    ),
+    "RedisEnterpriseAcceptanceFinding": SurfaceExport(
         "agora_plugins.redis.observability",
         "RedisEnterpriseAcceptanceFinding",
+        "supportability_public",
+        _surface_note("RedisEnterpriseAcceptanceFinding"),
     ),
-    "RedisEnterpriseAcceptanceGate": (
+    "RedisEnterpriseAcceptanceGate": SurfaceExport(
         "agora_plugins.redis.observability",
         "RedisEnterpriseAcceptanceGate",
+        "supportability_public",
+        _surface_note("RedisEnterpriseAcceptanceGate"),
     ),
-    "RedisEnterpriseAcceptanceReport": (
+    "RedisEnterpriseAcceptanceReport": SurfaceExport(
         "agora_plugins.redis.observability",
         "RedisEnterpriseAcceptanceReport",
+        "supportability_public",
+        _surface_note("RedisEnterpriseAcceptanceReport"),
     ),
-    "RedisEmbeddingStore": ("agora_plugins.redis.dedup.stores", "RedisEmbeddingStore"),
-    "RedisLLMCache": ("agora_plugins.redis.ai", "RedisLLMCache"),
-    "RedisPrometheusExporter": ("agora_plugins.redis.observability", "RedisPrometheusExporter"),
-    "RedisSourcePoisonLoopRiskSnapshot": (
+    "RedisLLMCache": SurfaceExport(
+        "agora_plugins.redis.ai",
+        "RedisLLMCache",
+        "stable_public",
+        _surface_note("RedisLLMCache"),
+    ),
+    "RedisPrometheusExporter": SurfaceExport(
         "agora_plugins.redis.observability",
-        "RedisSourcePoisonLoopRiskSnapshot",
+        "RedisPrometheusExporter",
+        "supportability_public",
+        _surface_note("RedisPrometheusExporter"),
     ),
-    "RedisSinkEnterpriseAcceptanceThresholds": (
+    "RedisSink": SurfaceExport(
+        "agora_plugins.redis.sinks",
+        "RedisSink",
+        "stable_public",
+        _surface_note("RedisSink"),
+    ),
+    "RedisSinkEnterpriseAcceptanceThresholds": SurfaceExport(
         "agora_plugins.redis.observability",
         "RedisSinkEnterpriseAcceptanceThresholds",
+        "supportability_public",
+        _surface_note("RedisSinkEnterpriseAcceptanceThresholds"),
     ),
-    "RedisSink": ("agora_plugins.redis.sinks", "RedisSink"),
-    "RedisSinkMetricsSnapshot": ("agora_plugins.redis.sinks", "RedisSinkMetricsSnapshot"),
-    "RedisSourceEnterpriseAcceptanceThresholds": (
+    "RedisSinkMetricsSnapshot": SurfaceExport(
+        "agora_plugins.redis.sinks",
+        "RedisSinkMetricsSnapshot",
+        "supportability_public",
+        _surface_note("RedisSinkMetricsSnapshot"),
+    ),
+    "RedisSourceEnterpriseAcceptanceThresholds": SurfaceExport(
         "agora_plugins.redis.observability",
         "RedisSourceEnterpriseAcceptanceThresholds",
+        "supportability_public",
+        _surface_note("RedisSourceEnterpriseAcceptanceThresholds"),
     ),
-    "RedisStore": ("agora_plugins.redis.dedup.stores", "RedisStore"),
-    "RedisStreamSource": ("agora_plugins.redis.sources", "RedisStreamSource"),
-    "RedisStreamSourceHealthSnapshot": (
+    "RedisSourcePoisonLoopRiskSnapshot": SurfaceExport(
+        "agora_plugins.redis.observability",
+        "RedisSourcePoisonLoopRiskSnapshot",
+        "supportability_public",
+        _surface_note("RedisSourcePoisonLoopRiskSnapshot"),
+    ),
+    "RedisStore": SurfaceExport(
+        "agora_plugins.redis.dedup.stores",
+        "RedisStore",
+        "stable_public",
+        _surface_note("RedisStore"),
+    ),
+    "RedisStreamSource": SurfaceExport(
+        "agora_plugins.redis.sources",
+        "RedisStreamSource",
+        "stable_public",
+        _surface_note("RedisStreamSource"),
+    ),
+    "RedisStreamSourceHealthSnapshot": SurfaceExport(
         "agora_plugins.redis.observability",
         "RedisStreamSourceHealthSnapshot",
+        "supportability_public",
+        _surface_note("RedisStreamSourceHealthSnapshot"),
     ),
-    "RedisStreamSourceMetricsSnapshot": (
+    "RedisStreamSourceMetricsSnapshot": SurfaceExport(
         "agora_plugins.redis.observability",
         "RedisStreamSourceMetricsSnapshot",
+        "supportability_public",
+        _surface_note("RedisStreamSourceMetricsSnapshot"),
     ),
-    "build_kafka_redis_runtime": ("agora_plugins.redis.kafka", "build_kafka_redis_runtime"),
-    "build_kafka_redis_sink": ("agora_plugins.redis.kafka", "build_kafka_redis_sink"),
-    "build_kafka_redis_source": ("agora_plugins.redis.kafka", "build_kafka_redis_source"),
-    "wrap_kafka_redis_deserializer": (
+    "build_kafka_redis_runtime": SurfaceExport(
+        "agora_plugins.redis.kafka",
+        "build_kafka_redis_runtime",
+        "pattern_recipe",
+        _surface_note("build_kafka_redis_runtime"),
+    ),
+    "build_kafka_redis_sink": SurfaceExport(
+        "agora_plugins.redis.kafka",
+        "build_kafka_redis_sink",
+        "pattern_recipe",
+        _surface_note("build_kafka_redis_sink"),
+    ),
+    "build_kafka_redis_source": SurfaceExport(
+        "agora_plugins.redis.kafka",
+        "build_kafka_redis_source",
+        "pattern_recipe",
+        _surface_note("build_kafka_redis_source"),
+    ),
+    "wrap_kafka_redis_deserializer": SurfaceExport(
         "agora_plugins.redis.kafka",
         "wrap_kafka_redis_deserializer",
+        "pattern_recipe",
+        _surface_note("wrap_kafka_redis_deserializer"),
     ),
 }
+
+_EXPORTS = export_target_map(_SURFACE_EXPORTS)
+_EXPORTS["_doctor_readiness_provider"] = (
+    "agora_plugins.redis.doctor",
+    "DOCTOR_READINESS_PROVIDER",
+)
 
 
 def __getattr__(name: str) -> Any:
