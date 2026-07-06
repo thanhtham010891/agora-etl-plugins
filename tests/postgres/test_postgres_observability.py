@@ -70,8 +70,22 @@ class _FakeCursor:
 
 
 class _FakeConnection:
-    def __init__(self, cursor: _FakeCursor) -> None:
+    def __init__(self, cursor: _FakeCursor, *, split_probe_cursors: bool = False) -> None:
         self.cursor_obj = cursor
+        self._split_probe_cursors = split_probe_cursors
+        self._cursor_calls = 0
+        self._stream_cursor_assigned = False
+        self._stream_cursor_call_index = 2
+        if split_probe_cursors:
+            probe_rows = list(cursor._fetchone_rows)
+            cursor._fetchone_rows = []
+            self._probe_fetchone_rows = probe_rows
+            self._last_probe_row = (
+                probe_rows[-1] if probe_rows else {"is_standby": False, "replay_lag_s": 0.0}
+            )
+        else:
+            self._probe_fetchone_rows = []
+            self._last_probe_row = {"is_standby": False, "replay_lag_s": 0.0}
         self.commit_calls = 0
         self.rollback_calls = 0
         self.closed = False
@@ -85,7 +99,17 @@ class _FakeConnection:
 
     def cursor(self, **kwargs: object) -> _FakeCursor:
         self.cursor_invocations.append(dict(kwargs))
-        return self.cursor_obj
+        if not self._split_probe_cursors:
+            return self.cursor_obj
+        cursor_call = self._cursor_calls
+        self._cursor_calls += 1
+        if not self._stream_cursor_assigned and cursor_call == self._stream_cursor_call_index:
+            self._stream_cursor_assigned = True
+            return self.cursor_obj
+        probe_row = (
+            self._probe_fetchone_rows.pop(0) if self._probe_fetchone_rows else self._last_probe_row
+        )
+        return _FakeCursor([], fetchone_rows=[probe_row])
 
     async def commit(self) -> None:
         self.commit_calls += 1
@@ -143,7 +167,7 @@ async def test_postgres_source_metrics_snapshot_declares_checkpoint_rerun_contra
         batch_size=1,
         fetchone_rows=[{"is_standby": False, "replay_lag_s": 0.0}],
     )
-    connection = _FakeConnection(cursor)
+    connection = _FakeConnection(cursor, split_probe_cursors=True)
     _install_fake_psycopg(monkeypatch, connection)
 
     source = PostgresSource(

@@ -215,6 +215,98 @@ async def test_avro_deserializer_caches_writer_schema_by_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_avro_deserializer_evicts_old_writer_schemas_when_cache_is_bounded() -> None:
+    schema_one = json.dumps(
+        {
+            "type": "record",
+            "name": "EventOne",
+            "fields": [{"name": "slug", "type": "string"}],
+        }
+    )
+    schema_two = json.dumps(
+        {
+            "type": "record",
+            "name": "EventTwo",
+            "fields": [{"name": "slug", "type": "string"}],
+        }
+    )
+    registry = _FakeRegistryClient()
+    serializer_one = AvroSchemaRegistrySerializer[dict[str, Any]](
+        registry_client=registry,
+        subject="events-one-value",
+        schema=schema_one,
+        auto_register="always",
+    )
+    serializer_two = AvroSchemaRegistrySerializer[dict[str, Any]](
+        registry_client=registry,
+        subject="events-two-value",
+        schema=schema_two,
+        auto_register="always",
+    )
+    deserializer = AvroSchemaRegistryDeserializer[dict[str, Any]](
+        registry_client=registry,
+        schema_cache_max_entries=1,
+    )
+
+    await serializer_one.open()
+    await serializer_two.open()
+    first_payload = await serializer_one({"slug": "a"})
+    second_payload = await serializer_two({"slug": "b"})
+
+    await deserializer(first_payload)
+    await deserializer(second_payload)
+    await deserializer(first_payload)
+
+    assert registry.get_schema_calls == [1, 2, 1]
+    assert list(deserializer._writer_schemas.keys()) == [1]  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_schema_registry_default_auto_register_only_bootstraps_missing_subject() -> None:
+    schema = {"type": "record", "name": "OrderCreated", "fields": []}
+    schema_text = json.dumps(schema, separators=(",", ":"))
+    registry = _FakeRegistryClient()
+    registry._latest_by_subject["orders-value"] = RegisteredSchema(
+        schema_id=7,
+        subject="orders-value",
+        schema=schema_text,
+    )
+    serializer = AvroSchemaRegistrySerializer[dict[str, Any]](
+        registry_client=registry,
+        subject="orders-value",
+        schema=schema,
+    )
+
+    await serializer.open()
+
+    assert registry.get_latest_calls == ["orders-value"]
+    assert registry.register_calls == []
+
+
+def test_schema_registry_deserializers_reject_non_positive_cache_limits() -> None:
+    registry = _FakeRegistryClient()
+
+    with pytest.raises(ValueError, match="schema_cache_max_entries"):
+        AvroSchemaRegistryDeserializer[dict[str, Any]](
+            registry_client=registry,
+            schema_cache_max_entries=0,
+        )
+
+    with pytest.raises(ValueError, match="schema_cache_max_entries"):
+        JsonSchemaRegistryDeserializer[dict[str, Any]](
+            registry_client=registry,
+            schema_cache_max_entries=0,
+        )
+
+    with pytest.raises(ValueError, match="schema_cache_max_entries"):
+        ProtobufSchemaRegistryDeserializer[dict[str, Any]](
+            registry_client=registry,
+            message_type=dict,
+            schema_cache_max_entries=0,
+        )
+
+
+@pytest.mark.asyncio
 async def test_avro_serializer_validates_latest_schema_when_auto_register_is_disabled() -> None:
     registry = _FakeRegistryClient()
     registry._schemas_by_id[7] = RegisteredSchema(
@@ -831,6 +923,59 @@ async def test_protobuf_schema_registry_serializer_and_deserializer_round_trip()
 
 
 @pytest.mark.asyncio
+async def test_protobuf_serializer_missing_subject_mode_reuses_matching_subject_despite_indent() -> (
+    None
+):
+    pytest.importorskip("google.protobuf")
+
+    schema = """
+        syntax = "proto3";
+        package agora.test;
+
+        message OrderCreated {
+          string order_id = 1;
+          int32 amount = 2;
+        }
+
+        message CustomerCreated {
+          string customer_id = 1;
+        }
+    """
+    registry = _FakeRegistryClient()
+    registry._latest_by_subject["orders-proto-value"] = RegisteredSchema(
+        schema_id=7,
+        subject="orders-proto-value",
+        schema=(
+            'syntax = "proto3";\n'
+            "package agora.test;\n\n"
+            "message OrderCreated {\n"
+            "  string order_id = 1;\n"
+            "  int32 amount = 2;\n"
+            "}\n"
+            "message CustomerCreated {\n"
+            "  string customer_id = 1;\n"
+            "}"
+        ),
+        schema_type="PROTOBUF",
+    )
+    message_types = _make_protobuf_message_types("matching_subject.proto")
+    serializer = ProtobufSchemaRegistrySerializer[dict[str, Any]](
+        registry_client=registry,
+        subject="orders-proto-value",
+        schema=schema,
+        message_type=message_types["OrderCreated"],
+        message_indexes=(0,),
+    )
+
+    await serializer.open()
+    payload = await serializer({"order_id": "o-1", "amount": 42})
+
+    assert payload[:5] == b"\x00\x00\x00\x00\x07"
+    assert registry.get_latest_calls == ["orders-proto-value"]
+    assert registry.register_calls == []
+
+
+@pytest.mark.asyncio
 async def test_protobuf_serializer_rejects_schema_message_index_mismatch() -> None:
     pytest.importorskip("google.protobuf")
 
@@ -947,3 +1092,61 @@ async def test_protobuf_deserializer_rejects_registry_binding_mismatch() -> None
 
     with pytest.raises(ValueError, match="binding mismatch"):
         await deserializer(payload)
+
+
+@pytest.mark.asyncio
+async def test_protobuf_deserializer_evicts_old_registered_schemas_when_cache_is_bounded() -> None:
+    pytest.importorskip("google.protobuf")
+
+    message_types = _make_protobuf_message_types("eviction.proto")
+    schema = """
+        syntax = "proto3";
+        package agora.test;
+
+        message OrderCreated {
+          string order_id = 1;
+          int32 amount = 2;
+        }
+
+        message CustomerCreated {
+          string customer_id = 1;
+        }
+    """
+    registry = _FakeRegistryClient()
+    serializer_one = ProtobufSchemaRegistrySerializer[dict[str, Any]](
+        registry_client=registry,
+        subject="orders-proto-one-value",
+        schema=schema,
+        message_type=message_types["OrderCreated"],
+        auto_register="always",
+        message_indexes=(0,),
+    )
+    serializer_two = ProtobufSchemaRegistrySerializer[dict[str, Any]](
+        registry_client=registry,
+        subject="orders-proto-two-value",
+        schema=schema,
+        message_type=message_types["OrderCreated"],
+        auto_register="always",
+        message_indexes=(0,),
+    )
+    deserializer = ProtobufSchemaRegistryDeserializer[dict[str, Any]](
+        registry_client=registry,
+        message_type=message_types["OrderCreated"],
+        record_mapper=lambda message: message,
+        schema_cache_max_entries=1,
+    )
+
+    await serializer_one.open()
+    await serializer_two.open()
+    first_payload = await serializer_one({"order_id": "o-1", "amount": 1})
+    second_payload = await serializer_two({"order_id": "o-2", "amount": 2})
+
+    await deserializer(first_payload)
+    await deserializer(second_payload)
+    await deserializer(first_payload)
+
+    assert registry.get_schema_calls == [1, 2, 1]
+    assert list(deserializer._registered_schemas.keys()) == [1]  # type: ignore[attr-defined]
+    assert list(deserializer._validated_bindings.keys()) == [  # type: ignore[attr-defined]
+        (1, (0,))
+    ]

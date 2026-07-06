@@ -29,6 +29,75 @@ if TYPE_CHECKING:
 
 logger = logstruct.getLogger(__name__)
 
+_UPSERT_INDEX_PIPELINE_FIELD = "__pipeline_index_key"
+_UPSERT_INDEX_STAGE_FIELD = "__stage_index_key"
+_UPSERT_INDEX_PIPELINE_STAGE_FIELD = "__pipeline_stage_index_key"
+
+_DLQ_UPSERT_SCRIPT = """
+-- REDIS_DLQ_UPSERT
+local record_key = KEYS[1]
+local primary_index_key = KEYS[2]
+local pipeline_index_key = KEYS[3]
+local stage_index_key = KEYS[4]
+local pipeline_stage_index_key = KEYS[5]
+local field_count = tonumber(ARGV[1])
+local exists = redis.call("EXISTS", record_key) == 1
+local old_pipeline_index_key = redis.call("HGET", record_key, "__pipeline_index_key")
+local old_stage_index_key = redis.call("HGET", record_key, "__stage_index_key")
+local old_pipeline_stage_index_key = redis.call("HGET", record_key, "__pipeline_stage_index_key")
+local hash_args = {}
+for idx = 1, field_count * 2 do
+    hash_args[idx] = ARGV[idx + 1]
+end
+redis.call("HSET", record_key, unpack(hash_args))
+if not exists then
+    redis.call("RPUSH", primary_index_key, record_key)
+    redis.call("RPUSH", pipeline_index_key, record_key)
+    redis.call("RPUSH", stage_index_key, record_key)
+    redis.call("RPUSH", pipeline_stage_index_key, record_key)
+    return 1
+end
+local seen = {}
+for _, index_key in ipairs({
+    old_pipeline_index_key,
+    old_stage_index_key,
+    old_pipeline_stage_index_key,
+    pipeline_index_key,
+    stage_index_key,
+    pipeline_stage_index_key
+}) do
+    if index_key and index_key ~= "" and not seen[index_key] then
+        redis.call("LREM", index_key, 0, record_key)
+        seen[index_key] = true
+    end
+end
+redis.call("RPUSH", pipeline_index_key, record_key)
+redis.call("RPUSH", stage_index_key, record_key)
+redis.call("RPUSH", pipeline_stage_index_key, record_key)
+return 0
+"""
+
+_DLQ_ACKNOWLEDGE_SCRIPT = """
+-- REDIS_DLQ_ACKNOWLEDGE
+local record_key = KEYS[1]
+local primary_index_key = KEYS[2]
+local pipeline_index_key = redis.call("HGET", record_key, "__pipeline_index_key") or KEYS[3]
+local stage_index_key = redis.call("HGET", record_key, "__stage_index_key") or KEYS[4]
+local pipeline_stage_index_key = redis.call("HGET", record_key, "__pipeline_stage_index_key") or KEYS[5]
+redis.call("DEL", record_key)
+redis.call("LREM", primary_index_key, 0, record_key)
+if pipeline_index_key ~= "" then
+    redis.call("LREM", pipeline_index_key, 0, record_key)
+end
+if stage_index_key ~= "" then
+    redis.call("LREM", stage_index_key, 0, record_key)
+end
+if pipeline_stage_index_key ~= "" then
+    redis.call("LREM", pipeline_stage_index_key, 0, record_key)
+end
+return 1
+"""
+
 
 def _index_part(value: str) -> str:
     return quote(value, safe="")
@@ -42,6 +111,20 @@ def _coerce_datetime(value: datetime | str) -> datetime:
     if isinstance(value, datetime):
         return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
     return datetime.fromisoformat(value)
+
+
+def _has_redis_hash_tag(value: str) -> bool:
+    open_brace = value.find("{")
+    if open_brace == -1:
+        return False
+    close_brace = value.find("}", open_brace + 1)
+    return close_brace > open_brace + 1
+
+
+def _cluster_storage_prefix(key_prefix: str, *, redis_cluster: bool) -> str:
+    if not redis_cluster or _has_redis_hash_tag(key_prefix):
+        return key_prefix
+    return f"{key_prefix}:{{{key_prefix}}}"
 
 
 def _serialize_value(value: Any) -> str:
@@ -204,11 +287,17 @@ class RedisDLQSink(DLQSink):
     ) -> None:
         self._url = url
         self._key_prefix = key_prefix.rstrip(":")
+        self._storage_key_prefix = _cluster_storage_prefix(
+            self._key_prefix,
+            redis_cluster=redis_cluster,
+        )
         self._redis_cluster = redis_cluster
         self._sentinel_service_name = sentinel_service_name
         self._sentinel_urls = list(sentinel_urls or [])
         self._payload_policy = payload_policy
         self._client: Any | None = None
+        self._upsert_script: Any | None = None
+        self._acknowledge_script: Any | None = None
         self._write_call_count = 0
         self._write_batch_call_count = 0
         self._inserted_record_count = 0
@@ -236,6 +325,8 @@ class RedisDLQSink(DLQSink):
             sentinel_service_name=self._sentinel_service_name,
             sentinel_urls=self._sentinel_urls,
         )
+        self._upsert_script = self._client.register_script(_DLQ_UPSERT_SCRIPT)
+        self._acknowledge_script = self._client.register_script(_DLQ_ACKNOWLEDGE_SCRIPT)
         logger.info("redis_dlq_ready", prefix=self._key_prefix)
 
     async def close(self) -> None:
@@ -247,26 +338,8 @@ class RedisDLQSink(DLQSink):
         client = self._require_client()
         self._write_call_count += 1
         record_key = self._record_key(record)
-        existing_payload = await self._record_payload(client, record_key)
-        should_index = not existing_payload
         object.__setattr__(record, "_storage_id", record_key)
-        payload = _record_to_hash(record, payload_policy=self._payload_policy)
-        payload["storage_key"] = record_key
-        async with client.pipeline(transaction=not self._redis_cluster) as pipe:
-            pipe.hset(record_key, mapping=payload)
-            if should_index:
-                pipe.rpush(self._index_key, record_key)
-                for index_key in self._secondary_index_keys(record):
-                    pipe.rpush(index_key, record_key)
-            else:
-                for index_key in self._secondary_index_keys_from_payload(existing_payload) - (
-                    self._secondary_index_keys(record)
-                ):
-                    pipe.lrem(index_key, 0, record_key)
-                for index_key in self._secondary_index_keys(record):
-                    pipe.lrem(index_key, 0, record_key)
-                    pipe.rpush(index_key, record_key)
-            await pipe.execute()
+        should_index = await self._write_record(client, record, record_key)
         self._upserted_record_count += 1
         if should_index:
             self._inserted_record_count += 1
@@ -279,36 +352,12 @@ class RedisDLQSink(DLQSink):
         if not records:
             return
         self._write_batch_call_count += 1
-        entries: list[tuple[DLQRecord, str, bool, dict[str, str]]] = []
-        indexed_keys: set[str] = set()
+        inserted_count = 0
         for record in records:
             record_key = self._record_key(record)
             object.__setattr__(record, "_storage_id", record_key)
-            existing_payload = await self._record_payload(client, record_key)
-            should_index = record_key not in indexed_keys and not existing_payload
-            if should_index:
-                indexed_keys.add(record_key)
-            entries.append((record, record_key, should_index, existing_payload))
-
-        async with client.pipeline(transaction=not self._redis_cluster) as pipe:
-            for record, record_key, should_index, existing_payload in entries:
-                payload = _record_to_hash(record, payload_policy=self._payload_policy)
-                payload["storage_key"] = record_key
-                pipe.hset(record_key, mapping=payload)
-                if should_index:
-                    pipe.rpush(self._index_key, record_key)
-                    for index_key in self._secondary_index_keys(record):
-                        pipe.rpush(index_key, record_key)
-                else:
-                    for index_key in self._secondary_index_keys_from_payload(existing_payload) - (
-                        self._secondary_index_keys(record)
-                    ):
-                        pipe.lrem(index_key, 0, record_key)
-                    for index_key in self._secondary_index_keys(record):
-                        pipe.lrem(index_key, 0, record_key)
-                        pipe.rpush(index_key, record_key)
-            await pipe.execute()
-        inserted_count = sum(1 for _, _, should_index, _ in entries if should_index)
+            if await self._write_record(client, record, record_key):
+                inserted_count += 1
         self._inserted_record_count += inserted_count
         self._updated_record_count += len(records) - inserted_count
         self._upserted_record_count += len(records)
@@ -328,18 +377,7 @@ class RedisDLQSink(DLQSink):
     async def acknowledge(self, record: DLQRecord) -> None:
         client = self._require_client()
         record_key = self._existing_record_key(record)
-        existing_payload = await self._record_payload(client, record_key)
-        secondary_index_keys = (
-            self._secondary_index_keys_from_payload(existing_payload)
-            if existing_payload
-            else self._secondary_index_keys(record)
-        )
-        async with client.pipeline(transaction=not self._redis_cluster) as pipe:
-            pipe.delete(record_key)
-            pipe.lrem(self._index_key, 0, record_key)
-            for index_key in secondary_index_keys:
-                pipe.lrem(index_key, 0, record_key)
-            await pipe.execute()
+        await self._acknowledge_record(client, record, record_key)
         self._acknowledge_count += 1
         self._acknowledged_record_count += 1
         self._last_acknowledge_at = _now_utc()
@@ -376,36 +414,72 @@ class RedisDLQSink(DLQSink):
 
     @property
     def _index_key(self) -> str:
-        return f"{self._key_prefix}:__index__"
+        return self._index_key_for_prefix(self._storage_key_prefix)
 
     def _pipeline_index_key(self, pipeline_id: str) -> str:
-        return f"{self._key_prefix}:__index__:pipeline:{_index_part(pipeline_id)}"
+        return self._pipeline_index_key_for_prefix(self._storage_key_prefix, pipeline_id)
 
     def _stage_index_key(self, stage: str) -> str:
-        return f"{self._key_prefix}:__index__:stage:{_index_part(stage)}"
+        return self._stage_index_key_for_prefix(self._storage_key_prefix, stage)
 
     def _pipeline_stage_index_key(self, pipeline_id: str, stage: str) -> str:
-        return (
-            f"{self._key_prefix}:__index__:pipeline_stage:"
-            f"{_index_part(pipeline_id)}:{_index_part(stage)}"
+        return self._pipeline_stage_index_key_for_prefix(
+            self._storage_key_prefix,
+            pipeline_id,
+            stage,
         )
 
-    def _secondary_index_keys(self, record: DLQRecord) -> set[str]:
+    def _index_key_for_prefix(self, key_prefix: str) -> str:
+        return f"{key_prefix}:__index__"
+
+    def _pipeline_index_key_for_prefix(self, key_prefix: str, pipeline_id: str) -> str:
+        return f"{key_prefix}:__index__:pipeline:{_index_part(pipeline_id)}"
+
+    def _stage_index_key_for_prefix(self, key_prefix: str, stage: str) -> str:
+        return f"{key_prefix}:__index__:stage:{_index_part(stage)}"
+
+    def _pipeline_stage_index_key_for_prefix(
+        self,
+        key_prefix: str,
+        pipeline_id: str,
+        stage: str,
+    ) -> str:
+        return (
+            f"{key_prefix}:__index__:pipeline_stage:{_index_part(pipeline_id)}:{_index_part(stage)}"
+        )
+
+    def _secondary_index_keys(
+        self, record: DLQRecord, *, key_prefix: str | None = None
+    ) -> set[str]:
+        prefix = self._storage_key_prefix if key_prefix is None else key_prefix
         return {
-            self._pipeline_index_key(record.pipeline_id),
-            self._stage_index_key(record.stage),
-            self._pipeline_stage_index_key(record.pipeline_id, record.stage),
+            self._pipeline_index_key_for_prefix(prefix, record.pipeline_id),
+            self._stage_index_key_for_prefix(prefix, record.stage),
+            self._pipeline_stage_index_key_for_prefix(prefix, record.pipeline_id, record.stage),
         }
 
-    def _secondary_index_keys_from_payload(self, payload: dict[str, str]) -> set[str]:
+    def _secondary_index_keys_from_payload(
+        self,
+        payload: dict[str, str],
+        *,
+        key_prefix: str | None = None,
+    ) -> set[str]:
+        prefix = self._storage_key_prefix if key_prefix is None else key_prefix
+        explicit_index_keys = {
+            payload.get(_UPSERT_INDEX_PIPELINE_FIELD) or "",
+            payload.get(_UPSERT_INDEX_STAGE_FIELD) or "",
+            payload.get(_UPSERT_INDEX_PIPELINE_STAGE_FIELD) or "",
+        } - {""}
+        if explicit_index_keys:
+            return explicit_index_keys
         pipeline_id = payload.get("pipeline_id")
         stage = payload.get("stage")
         if not pipeline_id or not stage:
             return set()
         return {
-            self._pipeline_index_key(pipeline_id),
-            self._stage_index_key(stage),
-            self._pipeline_stage_index_key(pipeline_id, stage),
+            self._pipeline_index_key_for_prefix(prefix, pipeline_id),
+            self._stage_index_key_for_prefix(prefix, stage),
+            self._pipeline_stage_index_key_for_prefix(prefix, pipeline_id, stage),
         }
 
     def _record_key(self, record: DLQRecord) -> str:
@@ -413,7 +487,7 @@ class RedisDLQSink(DLQSink):
         if isinstance(storage_id, str) and storage_id:
             return storage_id
         return (
-            f"{self._key_prefix}:{record.pipeline_id}:{record.run_id}:"
+            f"{self._storage_key_prefix}:{record.pipeline_id}:{record.run_id}:"
             f"{record.stage}:{record.created_at.isoformat()}:{uuid.uuid4().hex}"
         )
 
@@ -426,6 +500,112 @@ class RedisDLQSink(DLQSink):
     @staticmethod
     async def _record_payload(client: Any, record_key: str) -> dict[str, str]:
         return cast("dict[str, str]", await client.hgetall(record_key))
+
+    async def _write_record(self, client: Any, record: DLQRecord, record_key: str) -> bool:
+        index_prefix = self._index_prefix_for_record_key(record_key)
+        payload = self._record_hash(record, record_key, index_prefix=index_prefix)
+        secondary_index_keys = self._secondary_index_keys(record, key_prefix=index_prefix)
+        if self._upsert_script is not None and index_prefix == self._storage_key_prefix:
+            ordered_secondary_keys = self._ordered_secondary_index_keys(record)
+            inserted = await self._upsert_script(
+                keys=[record_key, self._index_key, *ordered_secondary_keys],
+                args=self._flatten_hash_mapping(payload),
+            )
+            return int(inserted or 0) == 1
+
+        existing_payload = await self._record_payload(client, record_key)
+        should_index = not existing_payload
+        async with client.pipeline(transaction=not self._redis_cluster) as pipe:
+            pipe.hset(record_key, mapping=payload)
+            if should_index:
+                pipe.rpush(self._index_key_for_prefix(index_prefix), record_key)
+                for index_key in secondary_index_keys:
+                    pipe.rpush(index_key, record_key)
+            else:
+                for index_key in self._secondary_index_keys_from_payload(existing_payload) - (
+                    secondary_index_keys
+                ):
+                    pipe.lrem(index_key, 0, record_key)
+                for index_key in secondary_index_keys:
+                    pipe.lrem(index_key, 0, record_key)
+                    pipe.rpush(index_key, record_key)
+            await pipe.execute()
+        return should_index
+
+    async def _acknowledge_record(self, client: Any, record: DLQRecord, record_key: str) -> None:
+        existing_payload = await self._record_payload(client, record_key)
+        index_prefix = self._index_prefix_for_record_key(record_key)
+        if (
+            self._acknowledge_script is not None
+            and index_prefix == self._storage_key_prefix
+            and (
+                not self._redis_cluster or bool(existing_payload.get(_UPSERT_INDEX_PIPELINE_FIELD))
+            )
+        ):
+            await self._acknowledge_script(
+                keys=[record_key, self._index_key, *self._ordered_secondary_index_keys(record)],
+                args=[],
+            )
+            return
+
+        secondary_index_keys = (
+            self._secondary_index_keys_from_payload(existing_payload, key_prefix=index_prefix)
+            if existing_payload
+            else self._secondary_index_keys(record, key_prefix=index_prefix)
+        )
+        async with client.pipeline(transaction=not self._redis_cluster) as pipe:
+            pipe.delete(record_key)
+            pipe.lrem(self._index_key_for_prefix(index_prefix), 0, record_key)
+            for index_key in secondary_index_keys:
+                pipe.lrem(index_key, 0, record_key)
+            await pipe.execute()
+
+    def _record_hash(
+        self,
+        record: DLQRecord,
+        record_key: str,
+        *,
+        index_prefix: str,
+    ) -> dict[str, str]:
+        payload = _record_to_hash(record, payload_policy=self._payload_policy)
+        payload["storage_key"] = record_key
+        payload.update(self._index_metadata(record, index_prefix=index_prefix))
+        return payload
+
+    def _index_metadata(self, record: DLQRecord, *, index_prefix: str) -> dict[str, str]:
+        pipeline_index_key, stage_index_key, pipeline_stage_index_key = (
+            self._ordered_secondary_index_keys(record, key_prefix=index_prefix)
+        )
+        return {
+            _UPSERT_INDEX_PIPELINE_FIELD: pipeline_index_key,
+            _UPSERT_INDEX_STAGE_FIELD: stage_index_key,
+            _UPSERT_INDEX_PIPELINE_STAGE_FIELD: pipeline_stage_index_key,
+        }
+
+    def _ordered_secondary_index_keys(
+        self,
+        record: DLQRecord,
+        *,
+        key_prefix: str | None = None,
+    ) -> tuple[str, str, str]:
+        prefix = self._storage_key_prefix if key_prefix is None else key_prefix
+        return (
+            self._pipeline_index_key_for_prefix(prefix, record.pipeline_id),
+            self._stage_index_key_for_prefix(prefix, record.stage),
+            self._pipeline_stage_index_key_for_prefix(prefix, record.pipeline_id, record.stage),
+        )
+
+    def _index_prefix_for_record_key(self, record_key: str) -> str:
+        if record_key.startswith(f"{self._storage_key_prefix}:"):
+            return self._storage_key_prefix
+        return self._key_prefix
+
+    @staticmethod
+    def _flatten_hash_mapping(mapping: dict[str, str]) -> list[str]:
+        flattened: list[str] = [str(len(mapping))]
+        for key, value in mapping.items():
+            flattened.extend((key, value))
+        return flattened
 
     def _require_client(self) -> Any:
         if self._client is None:
@@ -453,6 +633,10 @@ class RedisDLQSource(DLQSource):
     ) -> None:
         self._url = url
         self._key_prefix = key_prefix.rstrip(":")
+        self._storage_key_prefix = _cluster_storage_prefix(
+            self._key_prefix,
+            redis_cluster=redis_cluster,
+        )
         self._pipeline_id = pipeline_id
         self._stage = stage
         self._limit = limit
@@ -522,36 +706,68 @@ class RedisDLQSource(DLQSource):
 
     @property
     def _index_key(self) -> str:
-        return f"{self._key_prefix}:__index__"
+        return self._index_key_for_prefix(self._storage_key_prefix)
 
     def _pipeline_index_key(self, pipeline_id: str) -> str:
-        return f"{self._key_prefix}:__index__:pipeline:{_index_part(pipeline_id)}"
+        return self._pipeline_index_key_for_prefix(self._storage_key_prefix, pipeline_id)
 
     def _stage_index_key(self, stage: str) -> str:
-        return f"{self._key_prefix}:__index__:stage:{_index_part(stage)}"
+        return self._stage_index_key_for_prefix(self._storage_key_prefix, stage)
 
     def _pipeline_stage_index_key(self, pipeline_id: str, stage: str) -> str:
+        return self._pipeline_stage_index_key_for_prefix(
+            self._storage_key_prefix,
+            pipeline_id,
+            stage,
+        )
+
+    def _index_key_for_prefix(self, key_prefix: str) -> str:
+        return f"{key_prefix}:__index__"
+
+    def _pipeline_index_key_for_prefix(self, key_prefix: str, pipeline_id: str) -> str:
+        return f"{key_prefix}:__index__:pipeline:{_index_part(pipeline_id)}"
+
+    def _stage_index_key_for_prefix(self, key_prefix: str, stage: str) -> str:
+        return f"{key_prefix}:__index__:stage:{_index_part(stage)}"
+
+    def _pipeline_stage_index_key_for_prefix(
+        self,
+        key_prefix: str,
+        pipeline_id: str,
+        stage: str,
+    ) -> str:
         return (
-            f"{self._key_prefix}:__index__:pipeline_stage:"
-            f"{_index_part(pipeline_id)}:{_index_part(stage)}"
+            f"{key_prefix}:__index__:pipeline_stage:{_index_part(pipeline_id)}:{_index_part(stage)}"
         )
 
     async def _resolve_index_key(self, client: Any) -> str:
-        preferred = self._preferred_index_key()
-        if preferred == self._index_key:
-            return preferred
+        preferred = self._preferred_index_key(self._storage_key_prefix)
         if await client.exists(preferred):
             return preferred
+        legacy_preferred = self._preferred_index_key(self._key_prefix)
+        if legacy_preferred != preferred and await client.exists(legacy_preferred):
+            return legacy_preferred
+        if preferred == self._index_key:
+            return preferred
+        if await client.exists(self._index_key):
+            return self._index_key
+        legacy_primary = self._index_key_for_prefix(self._key_prefix)
+        if legacy_primary != self._index_key and await client.exists(legacy_primary):
+            return legacy_primary
         return self._index_key
 
-    def _preferred_index_key(self) -> str:
+    def _preferred_index_key(self, key_prefix: str) -> str:
         if self._pipeline_id is not None and self._stage is not None:
-            return self._pipeline_stage_index_key(self._pipeline_id, self._stage)
+            return self._pipeline_stage_index_key_for_prefix(
+                key_prefix,
+                self._pipeline_id,
+                self._stage,
+            )
         if self._pipeline_id is not None:
-            return self._pipeline_index_key(self._pipeline_id)
+            return self._pipeline_index_key_for_prefix(key_prefix, self._pipeline_id)
         if self._stage is not None:
-            return self._stage_index_key(self._stage)
-        return self._index_key
+            return self._stage_index_key_for_prefix(key_prefix, self._stage)
+        return self._index_key_for_prefix(key_prefix)
 
     def _require_client(self) -> Any:
         if self._client is None:

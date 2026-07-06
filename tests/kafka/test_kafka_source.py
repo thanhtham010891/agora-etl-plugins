@@ -841,7 +841,7 @@ async def test_bad_messages_can_dlq_and_continue_when_opted_in() -> None:
 
 
 @pytest.mark.asyncio
-async def test_poison_dlq_write_failure_raises_without_advancing_continue_policy() -> None:
+async def test_poison_dlq_write_failure_continues_and_commits_when_policy_allows_progress() -> None:
     def deserializer(value: bytes) -> str:
         if value == b"bad":
             raise ValueError("bad payload")
@@ -858,14 +858,14 @@ async def test_poison_dlq_write_failure_raises_without_advancing_continue_policy
     consumer = _FakeConsumer([b"good", b"bad", b"ok"])
     source._consumer = consumer  # type: ignore[attr-defined]
 
-    with pytest.raises(RuntimeError, match="dlq unavailable"):
-        _ = [record async for record in source.stream()]
+    records = [record async for record in source.stream()]
 
+    assert records == ["good", "ok"]
     assert source.runtime_metrics().to_dict() == {
         "record_error_count": 1,
-        "record_drop_count": 0,
+        "record_drop_count": 1,
     }
-    assert consumer.commit_calls == 1
+    assert consumer.commit_calls == 3
     metrics = source.operational_metrics().to_dict()
     assert metrics["poison_record_dlq_write_count"] == 0
     assert metrics["poison_record_dlq_write_failure_count"] == 1

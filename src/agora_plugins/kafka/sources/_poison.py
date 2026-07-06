@@ -165,10 +165,7 @@ def handle_poison_dlq_write_error(
         policy=owner._poison_record_policy.value,
         error=str(exc),
     )
-    if owner._poison_record_policy in {
-        KafkaPoisonRecordPolicy.DLQ_AND_CONTINUE,
-        KafkaPoisonRecordPolicy.DLQ_AND_FAIL_CLOSED,
-    }:
+    if owner._poison_record_policy == KafkaPoisonRecordPolicy.DLQ_AND_FAIL_CLOSED:
         raise exc
 
 

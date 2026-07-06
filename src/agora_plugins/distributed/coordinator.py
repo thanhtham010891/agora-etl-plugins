@@ -83,9 +83,46 @@ return {0, false}
 _REDLOCK_ACQUIRE_SCRIPT = """
 -- REDLOCK_ACQUIRE
 local lease = redis.call("GET", KEYS[1])
-if lease ~= false then return 0 end
-local ok = redis.call("SET", KEYS[1], ARGV[1], "NX", "EX", tonumber(ARGV[2]))
-if ok then return 1 end
+if lease ~= false then return {0, false} end
+local value = cjson.encode({
+    worker_id = ARGV[1],
+    acquired_at = ARGV[2],
+    pipeline_id = ARGV[3],
+    run_number = tonumber(ARGV[4]),
+    fencing_token = tonumber(ARGV[6])
+})
+local ok = redis.call("SET", KEYS[1], value, "NX", "EX", tonumber(ARGV[5]))
+if ok then return {1, tonumber(ARGV[6])} end
+return {0, false}
+"""
+
+_REDLOCK_RELEASE_SCRIPT = """
+-- REDLOCK_RELEASE
+local val = redis.call("GET", KEYS[1])
+if val == false then return 0 end
+local ok, data = pcall(cjson.decode, val)
+if not ok then return 0 end
+if data["worker_id"] == ARGV[1]
+   and tostring(data["acquired_at"]) == ARGV[2]
+   and tostring(data["fencing_token"]) == ARGV[3] then
+    redis.call("DEL", KEYS[1])
+    return 1
+end
+return 0
+"""
+
+_REDLOCK_RENEW_SCRIPT = """
+-- REDLOCK_RENEW
+local val = redis.call("GET", KEYS[1])
+if val == false then return 0 end
+local ok, data = pcall(cjson.decode, val)
+if not ok then return 0 end
+if data["worker_id"] == ARGV[1]
+   and tostring(data["acquired_at"]) == ARGV[2]
+   and tostring(data["fencing_token"]) == ARGV[3] then
+    redis.call("EXPIRE", KEYS[1], tonumber(ARGV[4]))
+    return 1
+end
 return 0
 """
 
@@ -127,8 +164,9 @@ class RedisWorkerCoordinator(WorkerCoordinator):
     redlock_redis_urls:
         Optional list of at least three independent Redis master URLs. When
         provided, per-pipeline leases are acquired and renewed by Redlock-style
-        majority quorum across those nodes. Worker registry and fencing-token
-        generation continue to use ``redis_url``.
+        majority quorum across those nodes. Worker registry and authoritative
+        fencing tokens continue to use ``redis_url`` while quorum nodes enforce
+        majority lease ownership.
     redlock_clock_drift_factor:
         Safety margin factor subtracted from Redlock lease validity.
     """
@@ -186,6 +224,7 @@ class RedisWorkerCoordinator(WorkerCoordinator):
         self._redlock_renew_scripts: list[Any] = []
         self._redlock_lease_nodes: dict[str, set[int]] = {}
         self._lease_tokens: dict[str, LeaseState] = {}
+        self._local_fencing_tokens: dict[str, int] = {}
         self._lease_lost_callback: Any | None = None
         self._lock = asyncio.Lock()
 
@@ -249,6 +288,8 @@ class RedisWorkerCoordinator(WorkerCoordinator):
 
     async def stop(self) -> None:
         if self._redis is None:
+            self._lease_tokens.clear()
+            self._redlock_lease_nodes.clear()
             return
 
         await self._register_worker("draining")
@@ -288,7 +329,7 @@ class RedisWorkerCoordinator(WorkerCoordinator):
 
     async def try_acquire_lease(self, pipeline_id: str, run_number: int) -> bool:
         if self._redis is None:
-            return self._fallback_to_local
+            return self._acquire_local_fallback_lease(pipeline_id, run_number)
         if self._redlock_enabled():
             return await self._try_acquire_redlock_lease(pipeline_id, run_number)
 
@@ -333,7 +374,11 @@ class RedisWorkerCoordinator(WorkerCoordinator):
             return False
 
     async def release_lease(self, pipeline_id: str) -> None:
-        if self._redis is None or self._release_script is None:
+        if self._redis is None:
+            self._lease_tokens.pop(pipeline_id, None)
+            self._redlock_lease_nodes.pop(pipeline_id, None)
+            return
+        if self._release_script is None:
             return
         lease = self._lease_tokens.pop(pipeline_id, None)
         self._redlock_lease_nodes.pop(pipeline_id, None)
@@ -346,6 +391,7 @@ class RedisWorkerCoordinator(WorkerCoordinator):
         if self._redlock_enabled():
             await self._release_redlock_indices(
                 pipeline_id,
+                lease.acquired_at,
                 lease.fencing_token,
                 range(len(self._redlock_release_scripts)),
             )
@@ -370,7 +416,9 @@ class RedisWorkerCoordinator(WorkerCoordinator):
     async def validate_lease(self, pipeline_id: str, fencing_token: int) -> bool:
         """Authoritatively validate that this worker still owns the lease token."""
         if self._redis is None:
-            return False
+            if not self._fallback_to_local:
+                return False
+            return await super().validate_lease(pipeline_id, fencing_token)
         if self._redlock_enabled():
             return await self._validate_redlock_lease(pipeline_id, fencing_token)
         try:
@@ -404,7 +452,22 @@ class RedisWorkerCoordinator(WorkerCoordinator):
     async def renew_lease(self, pipeline_id: str) -> bool:
         """Renew a held lease if this worker still owns its fencing token."""
 
-        if self._redis is None or self._renew_script is None:
+        if self._redis is None:
+            if not self._fallback_to_local:
+                return False
+            lease = self._lease_tokens.get(pipeline_id)
+            if lease is None:
+                return False
+            self._lease_tokens[pipeline_id] = LeaseState(
+                pipeline_id=lease.pipeline_id,
+                run_number=lease.run_number,
+                worker_id=lease.worker_id,
+                fencing_token=lease.fencing_token,
+                acquired_at=lease.acquired_at,
+                renewed_at=_utcnow(),
+            )
+            return True
+        if self._renew_script is None:
             return False
         if self._redlock_enabled():
             return await self._renew_redlock_lease(pipeline_id)
@@ -433,6 +496,20 @@ class RedisWorkerCoordinator(WorkerCoordinator):
             fencing_token=lease.fencing_token,
             acquired_at=lease.acquired_at,
             renewed_at=_utcnow(),
+        )
+        return True
+
+    def _acquire_local_fallback_lease(self, pipeline_id: str, run_number: int) -> bool:
+        if not self._fallback_to_local or pipeline_id in self._lease_tokens:
+            return False
+        fencing_token = self._local_fencing_tokens.get(pipeline_id, 0) + 1
+        self._local_fencing_tokens[pipeline_id] = fencing_token
+        self._lease_tokens[pipeline_id] = LeaseState(
+            pipeline_id=pipeline_id,
+            run_number=run_number,
+            worker_id=self._worker_id,
+            fencing_token=fencing_token,
+            acquired_at=_utcnow(),
         )
         return True
 
@@ -516,8 +593,8 @@ class RedisWorkerCoordinator(WorkerCoordinator):
             await node.ping()
             self._redlock_redis_nodes.append(node)
             self._redlock_acquire_scripts.append(node.register_script(_REDLOCK_ACQUIRE_SCRIPT))
-            self._redlock_release_scripts.append(node.register_script(_RELEASE_SCRIPT))
-            self._redlock_renew_scripts.append(node.register_script(_RENEW_SCRIPT))
+            self._redlock_release_scripts.append(node.register_script(_REDLOCK_RELEASE_SCRIPT))
+            self._redlock_renew_scripts.append(node.register_script(_REDLOCK_RENEW_SCRIPT))
 
     async def _close_redlock_nodes(self) -> None:
         for node in self._redlock_redis_nodes:
@@ -530,30 +607,25 @@ class RedisWorkerCoordinator(WorkerCoordinator):
         self._redlock_lease_nodes.clear()
 
     async def _try_acquire_redlock_lease(self, pipeline_id: str, run_number: int) -> bool:
-        if self._redis is None:
-            return False
-        if not self._redlock_acquire_scripts:
+        if not self._redlock_acquire_scripts or self._redis is None:
             return False
 
         acquired_at = _utcnow()
-        fencing_token = int(await self._redis.incr(self._fencing_key(pipeline_id)))
-        await self._redis.expire(self._fencing_key(pipeline_id), self._fencing_key_ttl_seconds)
-        payload = json.dumps(
-            {
-                "worker_id": self._worker_id,
-                "acquired_at": acquired_at,
-                "pipeline_id": pipeline_id,
-                "run_number": run_number,
-                "fencing_token": fencing_token,
-            }
-        )
+        fencing_token = await self._reserve_redlock_fencing_token(pipeline_id)
         acquired_indices: set[int] = set()
         started = time.monotonic()
         for index, script in enumerate(self._redlock_acquire_scripts):
             try:
                 result = await script(
-                    keys=[self._lease_key(pipeline_id)],
-                    args=[payload, str(self._lease_ttl)],
+                    keys=[self._lease_key(pipeline_id), self._fencing_key(pipeline_id)],
+                    args=[
+                        self._worker_id,
+                        acquired_at,
+                        pipeline_id,
+                        str(run_number),
+                        str(self._lease_ttl),
+                        str(fencing_token),
+                    ],
                 )
             except Exception as exc:
                 logger.warning(
@@ -563,7 +635,7 @@ class RedisWorkerCoordinator(WorkerCoordinator):
                     error=str(exc),
                 )
                 continue
-            if int(result or 0) == 1:
+            if isinstance(result, list) and int(result[0] or 0) == 1:
                 acquired_indices.add(index)
 
         elapsed = time.monotonic() - started
@@ -581,7 +653,12 @@ class RedisWorkerCoordinator(WorkerCoordinator):
             self._redlock_lease_nodes[pipeline_id] = acquired_indices
             return True
 
-        await self._release_redlock_indices(pipeline_id, fencing_token, acquired_indices)
+        await self._release_redlock_indices(
+            pipeline_id,
+            acquired_at,
+            fencing_token,
+            acquired_indices,
+        )
         logger.debug(
             "coordinator_redlock_lease_skipped",
             pipeline_id=pipeline_id,
@@ -592,9 +669,18 @@ class RedisWorkerCoordinator(WorkerCoordinator):
         )
         return False
 
+    async def _reserve_redlock_fencing_token(self, pipeline_id: str) -> int:
+        if self._redis is None:
+            raise RuntimeError("RedisWorkerCoordinator primary Redis is not connected")
+        fence_key = self._fencing_key(pipeline_id)
+        token = int(await self._redis.incr(fence_key))
+        await self._redis.expire(fence_key, self._fencing_key_ttl_seconds)
+        return token
+
     async def _release_redlock_indices(
         self,
         pipeline_id: str,
+        acquired_at: str,
         fencing_token: int,
         indices: range | set[int],
     ) -> None:
@@ -602,7 +688,7 @@ class RedisWorkerCoordinator(WorkerCoordinator):
             try:
                 await self._redlock_release_scripts[index](
                     keys=[self._lease_key(pipeline_id)],
-                    args=[self._worker_id, str(fencing_token)],
+                    args=[self._worker_id, acquired_at, str(fencing_token)],
                 )
             except Exception as exc:
                 logger.warning(
@@ -613,6 +699,9 @@ class RedisWorkerCoordinator(WorkerCoordinator):
                 )
 
     async def _validate_redlock_lease(self, pipeline_id: str, fencing_token: int) -> bool:
+        lease = self._lease_tokens.get(pipeline_id)
+        if lease is None or lease.fencing_token != fencing_token:
+            return False
         matching_nodes = 0
         for index, node in enumerate(self._redlock_redis_nodes):
             try:
@@ -625,7 +714,12 @@ class RedisWorkerCoordinator(WorkerCoordinator):
                     error=str(exc),
                 )
                 continue
-            if _lease_payload_matches(raw, self._worker_id, fencing_token):
+            if _lease_payload_matches_redlock(
+                raw,
+                self._worker_id,
+                lease.acquired_at,
+                lease.fencing_token,
+            ):
                 matching_nodes += 1
         valid = matching_nodes >= self._redlock_quorum()
         if not valid:
@@ -647,7 +741,12 @@ class RedisWorkerCoordinator(WorkerCoordinator):
             try:
                 renewed = await self._redlock_renew_scripts[index](
                     keys=[self._lease_key(pipeline_id)],
-                    args=[self._worker_id, str(lease.fencing_token), str(self._lease_ttl)],
+                    args=[
+                        self._worker_id,
+                        lease.acquired_at,
+                        str(lease.fencing_token),
+                        str(self._lease_ttl),
+                    ],
                 )
             except Exception as exc:
                 logger.warning(
@@ -673,7 +772,12 @@ class RedisWorkerCoordinator(WorkerCoordinator):
             )
             return True
 
-        await self._release_redlock_indices(pipeline_id, lease.fencing_token, renewed_indices)
+        await self._release_redlock_indices(
+            pipeline_id,
+            lease.acquired_at,
+            lease.fencing_token,
+            renewed_indices,
+        )
         await self._mark_lease_lost(pipeline_id, lease, reason="redlock_renew_quorum_failed")
         self._redlock_lease_nodes.pop(pipeline_id, None)
         return False
@@ -786,4 +890,23 @@ def _lease_payload_matches(raw: object, worker_id: str, fencing_token: int) -> b
         return False
     return data.get("worker_id") == worker_id and str(data.get("fencing_token")) == str(
         fencing_token
+    )
+
+
+def _lease_payload_matches_redlock(
+    raw: object,
+    worker_id: str,
+    acquired_at: str,
+    fencing_token: int,
+) -> bool:
+    if raw is None:
+        return False
+    try:
+        data = json.loads(str(raw))
+    except Exception:
+        return False
+    return (
+        data.get("worker_id") == worker_id
+        and str(data.get("acquired_at")) == acquired_at
+        and str(data.get("fencing_token")) == str(fencing_token)
     )

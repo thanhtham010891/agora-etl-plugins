@@ -146,14 +146,27 @@ async def test_redis_embedding_store_mark_if_new_is_atomic() -> None:
             return None
 
     class _FakeRedis:
-        def lock(self, name: str, *, timeout: float, blocking_timeout: float) -> _FakeLock:
-            del name, timeout, blocking_timeout
+        def lock(
+            self,
+            name: str,
+            *,
+            timeout: float,
+            blocking_timeout: float,
+            raise_on_release_error: bool,
+        ) -> _FakeLock:
+            del name, timeout, blocking_timeout, raise_on_release_error
             return _FakeLock()
 
     store._redis = _FakeRedis()  # type: ignore[assignment]
 
-    async def _exists(*, query_embedding: list[float]) -> bool:
+    async def _exists(
+        *,
+        query_embedding: list[float],
+        on_scan_step=None,
+    ) -> bool:
         del query_embedding
+        if on_scan_step is not None:
+            on_scan_step()
         await asyncio.sleep(0)
         return seen
 
@@ -175,6 +188,148 @@ async def test_redis_embedding_store_mark_if_new_is_atomic() -> None:
 
     assert (first, second) == (True, False)
     assert lock_acquisitions == 2
+
+
+@pytest.mark.asyncio
+async def test_redis_embedding_store_renews_mark_lock_during_slow_scan() -> None:
+    class _FakeProvider:
+        async def embed(self, text: str):
+            del text
+            return SimpleNamespace(embedding=[1.0, 0.0])
+
+        async def embed_batch(self, texts: list[str]):
+            return [await self.embed(text) for text in texts]
+
+    reacquire_calls = 0
+
+    class _FakeLock:
+        async def __aenter__(self) -> _FakeLock:
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+        async def reacquire(self) -> bool:
+            nonlocal reacquire_calls
+            reacquire_calls += 1
+            return True
+
+    class _FakeRedis:
+        def lock(
+            self,
+            name: str,
+            *,
+            timeout: float,
+            blocking_timeout: float,
+            raise_on_release_error: bool,
+        ) -> _FakeLock:
+            del name, timeout, blocking_timeout, raise_on_release_error
+            return _FakeLock()
+
+    store = RedisEmbeddingStore(provider=_FakeProvider(), lock_timeout_s=0.06)
+    store._redis = _FakeRedis()  # type: ignore[assignment]
+
+    async def _exists(
+        query_embedding: list[float],
+        *,
+        on_scan_step=None,
+    ) -> bool:
+        del query_embedding
+        if on_scan_step is not None:
+            on_scan_step()
+        await asyncio.sleep(0.14)
+        if on_scan_step is not None:
+            on_scan_step()
+        return False
+
+    added: list[str] = []
+
+    async def _add(
+        key: str,
+        embedding: list[float],
+        *,
+        ttl_seconds: int | None = None,
+    ) -> None:
+        del embedding, ttl_seconds
+        added.append(key)
+
+    store._redis_exists = _exists  # type: ignore[method-assign]
+    store._redis_add = _add  # type: ignore[method-assign]
+
+    assert await store.mark_if_new("needle") is True
+    assert added == ["needle"]
+    assert reacquire_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_redis_embedding_store_fails_closed_when_mark_lock_cannot_be_renewed() -> None:
+    class _FakeProvider:
+        async def embed(self, text: str):
+            del text
+            return SimpleNamespace(embedding=[1.0, 0.0])
+
+        async def embed_batch(self, texts: list[str]):
+            return [await self.embed(text) for text in texts]
+
+    class _FakeLock:
+        def __init__(self) -> None:
+            self.reacquire_calls = 0
+
+        async def __aenter__(self) -> _FakeLock:
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+        async def reacquire(self) -> bool:
+            self.reacquire_calls += 1
+            return False
+
+    class _FakeRedis:
+        def __init__(self) -> None:
+            self.lock_obj = _FakeLock()
+
+        def lock(
+            self,
+            name: str,
+            *,
+            timeout: float,
+            blocking_timeout: float,
+            raise_on_release_error: bool,
+        ) -> _FakeLock:
+            del name, timeout, blocking_timeout, raise_on_release_error
+            return self.lock_obj
+
+    store = RedisEmbeddingStore(provider=_FakeProvider(), lock_timeout_s=0.06)
+    fake_redis = _FakeRedis()
+    store._redis = fake_redis  # type: ignore[assignment]
+
+    async def _exists(
+        query_embedding: list[float],
+        *,
+        on_scan_step=None,
+    ) -> bool:
+        del query_embedding
+        await asyncio.sleep(0.14)
+        if on_scan_step is not None:
+            on_scan_step()
+        return False
+
+    async def _add(
+        key: str,
+        embedding: list[float],
+        *,
+        ttl_seconds: int | None = None,
+    ) -> None:
+        del key, embedding, ttl_seconds
+        raise AssertionError("_redis_add should not run after lock renewal fails")
+
+    store._redis_exists = _exists  # type: ignore[method-assign]
+    store._redis_add = _add  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="lost the distributed mark lock"):
+        await store.mark_if_new("needle")
+    assert fake_redis.lock_obj.reacquire_calls >= 1
 
 
 @pytest.mark.asyncio
@@ -343,8 +498,15 @@ async def test_redis_embedding_store_applies_ttl_when_marking_new_key() -> None:
         def __init__(self) -> None:
             self.pipeline_obj = _FakePipeline()
 
-        def lock(self, name: str, *, timeout: float, blocking_timeout: float) -> _FakeLock:
-            del name, timeout, blocking_timeout
+        def lock(
+            self,
+            name: str,
+            *,
+            timeout: float,
+            blocking_timeout: float,
+            raise_on_release_error: bool,
+        ) -> _FakeLock:
+            del name, timeout, blocking_timeout, raise_on_release_error
             return _FakeLock()
 
         async def sscan(

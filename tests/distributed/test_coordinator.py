@@ -16,12 +16,14 @@ class _FakeScript:
         delay_s: float = 0.0,
         redis: _FakeRedis | None = None,
         kind: str = "",
+        match_field: str = "fencing_token",
     ) -> None:
         self.calls: list[tuple[list[str], list[str]]] = []
         self.result = result
         self.delay_s = delay_s
         self._redis = redis
         self._kind = kind
+        self._match_field = match_field
 
     async def __call__(self, *, keys: list[str], args: list[str]) -> object:
         if self.delay_s:
@@ -29,7 +31,10 @@ class _FakeScript:
         self.calls.append((keys, args))
         if self._kind == "release" and self._redis is not None:
             raw = self._redis.worker_payloads.get(keys[0])
-            if _payload_matches(raw, args[0], args[1]):
+            match_value = args[1]
+            if self._match_field == "fencing_token" and len(args) >= 3:
+                match_value = args[2]
+            if _payload_matches(raw, args[0], match_value, field=self._match_field):
                 self._redis.worker_payloads.pop(keys[0], None)
         return self.result
 
@@ -64,13 +69,22 @@ class _FakeRedlockAcquireScript:
         self._redis = redis
         self.calls: list[tuple[list[str], list[str]]] = []
 
-    async def __call__(self, *, keys: list[str], args: list[str]) -> int:
+    async def __call__(self, *, keys: list[str], args: list[str]) -> list[object]:
         self.calls.append((keys, args))
-        lease_key = keys[0]
+        lease_key, _fence_key = keys
         if not self._redis.redlock_acquire or lease_key in self._redis.worker_payloads:
-            return 0
-        self._redis.worker_payloads[lease_key] = args[0]
-        return 1
+            return [0, None]
+        token = int(args[5])
+        self._redis.worker_payloads[lease_key] = json.dumps(
+            {
+                "worker_id": args[0],
+                "acquired_at": args[1],
+                "pipeline_id": args[2],
+                "run_number": int(args[3]),
+                "fencing_token": token,
+            }
+        )
+        return [1, token]
 
 
 class _FakeRedis:
@@ -88,6 +102,13 @@ class _FakeRedis:
         self.redlock_acquire = redlock_acquire
         self.release_script = _FakeScript(script_result, redis=self, kind="release")
         self.renew_script = _FakeScript(script_result)
+        self.redlock_release_script = _FakeScript(
+            script_result,
+            redis=self,
+            kind="release",
+            match_field="fencing_token",
+        )
+        self.redlock_renew_script = _FakeScript(script_result)
         self.acquire_script = _FakeAcquireScript(self)
         self.redlock_acquire_script = _FakeRedlockAcquireScript(self)
         self.worker_payloads: dict[str, str] = {}
@@ -101,6 +122,10 @@ class _FakeRedis:
     def register_script(self, script: str) -> _FakeScript:
         if "REDLOCK_ACQUIRE" in script:
             return self.redlock_acquire_script  # type: ignore[return-value]
+        if "REDLOCK_RELEASE" in script:
+            return self.redlock_release_script
+        if "REDLOCK_RENEW" in script:
+            return self.redlock_renew_script
         if "INCR" in script and "cjson.encode" in script:
             return self.acquire_script  # type: ignore[return-value]
         if "EXPIRE" in script:
@@ -184,16 +209,20 @@ def _install_fake_aioredis_sequence(
     )
 
 
-def _payload_matches(raw: str | None, worker_id: str, fencing_token: str) -> bool:
+def _payload_matches(
+    raw: str | None,
+    worker_id: str,
+    match_value: str,
+    *,
+    field: str = "fencing_token",
+) -> bool:
     if raw is None:
         return False
     try:
         data = json.loads(raw)
     except Exception:
         return False
-    return data.get("worker_id") == worker_id and str(data.get("fencing_token")) == str(
-        fencing_token
-    )
+    return data.get("worker_id") == worker_id and str(data.get(field)) == str(match_value)
 
 
 @pytest.mark.asyncio
@@ -207,6 +236,12 @@ async def test_coordinator_can_fallback_to_local_on_redis_unavailable(
     await coordinator.start("worker-a", ["pipe-a"])
 
     assert await coordinator.try_acquire_lease("pipe-a", 1) is True
+    lease = coordinator.current_lease("pipe-a")
+    assert lease is not None
+    assert await coordinator.validate_lease("pipe-a", lease.fencing_token) is True
+    assert await coordinator.renew_lease("pipe-a") is True
+    await coordinator.release_lease("pipe-a")
+    assert coordinator.current_lease("pipe-a") is None
     assert await coordinator.list_workers() == []
 
 
@@ -447,6 +482,9 @@ async def test_coordinator_redlock_acquires_validates_and_releases_quorum(
     assert lease.fencing_token == 1
     assert primary.counters["agora:distributed:fence:pipe-a"] == 1
     assert primary.expire_calls == [("agora:distributed:fence:pipe-a", 30 * 24 * 60 * 60)]
+    for node in nodes:
+        assert node.counters == {}
+        assert node.expire_calls == []
     assert await coordinator.validate_lease("pipe-a", 1) is True
     assert all("agora:distributed:lease:pipe-a" in node.worker_payloads for node in nodes)
 
@@ -500,8 +538,8 @@ async def test_coordinator_redlock_marks_lease_lost_when_renew_quorum_fails(
     await coordinator.start("worker-a", ["pipe-a"])
 
     assert await coordinator.try_acquire_lease("pipe-a", 1) is True
-    nodes[1].renew_script.result = 0
-    nodes[2].renew_script.result = 0
+    nodes[1].redlock_renew_script.result = 0
+    nodes[2].redlock_renew_script.result = 0
 
     assert await coordinator.renew_lease("pipe-a") is False
     assert coordinator.current_lease("pipe-a") is None

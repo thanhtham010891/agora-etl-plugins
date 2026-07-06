@@ -12,14 +12,28 @@
 
 `agora-etl-plugins` extends [agora-etl](https://pypi.org/project/agora-etl/) with production-ready integrations. Plugins are auto-discovered via Python entry-points — install the package and they register themselves automatically, no manual wiring needed.
 
+This package owns backend depth, not runtime semantics:
+
+- `agora-etl` owns pipeline behavior, recovery contracts, CLI diagnostics, and
+  public extension boundaries
+- `agora-etl-plugins` owns first-party Redis, Kafka, PostgreSQL, cron,
+  distributed coordination, and Anthropic integrations
+- `agora-etl-rs` stays optional and accelerates the runtime without changing
+  the plugin contract
+
+If a question is about delivery guarantees, checkpoint semantics, lane
+selection, or replay contracts, the source of truth is still the core docs.
+If a question is about backend maturity, backend runbooks, or integration
+extras, this package is the right boundary.
+
 Canonical ecosystem docs live in the public Agora docs surface:
 
 - Plugin ecosystem overview:
-  <https://github.com/thanhtham010891/agora-etl/blob/main/packages/agora/docs/plugins/index.md>
+  <https://github.com/thanhtham010891/agora-etl/blob/main/docs/plugins/index.md>
 - Production readiness, compatibility, and release gates:
-  <https://github.com/thanhtham010891/agora-etl/blob/main/packages/agora/docs/plugins/production-readiness.md>
+  <https://github.com/thanhtham010891/agora-etl/blob/main/docs/plugins/production-readiness.md>
 - Core docs home:
-  <https://github.com/thanhtham010891/agora-etl/tree/main/packages/agora/docs>
+  <https://github.com/thanhtham010891/agora-etl/tree/main/docs>
 
 This README stays focused on package-specific quickstart information.
 
@@ -53,21 +67,23 @@ pip install "agora-etl-plugins[anthropic]"    # Anthropic completion and structu
 pip install "agora-etl-plugins[all]"          # Everything in one install
 ```
 
-This bundle now tracks the `agora-etl 0.4.x` compatibility line.
+This package now tracks the `agora-etl 0.4.x` compatibility line.
 Current floor: `agora-etl>=0.4.1,<1`.
 Supported Python versions: `3.11`, `3.12`, and `3.13`.
 
-Important current bundle shape:
+The package is intentionally depth-first, not catalog-first:
 
-- flagship backend families: Redis, Kafka, and PostgreSQL
-- focused official extensions: cron scheduling, distributed coordination, and
+- flagship backend families: Redis, Kafka, PostgreSQL
+- focused official extensions: cron scheduling, distributed coordination,
   Anthropic completion / structured output
-- runtime planning, `agora doctor`, and public data-plane contracts now come
+- runtime planning, `agora doctor`, and public data-plane contracts still come
   from the `agora-etl 0.4.x` core line
+- backend-specific release gates, production notes, and operator guidance live
+  here and in the main plugin docs
 
-Anthropic is now part of the official bundle through the `anthropic` extra,
-with a completion and structured-output support story that stays explicit about
-the lack of embeddings.
+Anthropic ships as an official first-party extra through `anthropic`, with a
+completion and structured-output support story that stays explicit about the
+lack of embeddings.
 
 If your pipelines checkpoint frequently, you can also enable the Rust checkpoint hot path
 from the core package:
@@ -103,10 +119,22 @@ only `tests/integration`, using those local Docker endpoints by default.
 
 ## Available plugins
 
+The sections below describe package-local quickstart usage.
+For support boundaries and maturity claims, prefer the canonical plugin docs:
+
+- <https://github.com/thanhtham010891/agora-etl/blob/main/docs/plugins/index.md>
+- <https://github.com/thanhtham010891/agora-etl/blob/main/docs/plugins/production-readiness.md>
+- <https://github.com/thanhtham010891/agora-etl/blob/main/docs/plugins/contract.md>
+
 ### Anthropic `[anthropic]`
 
 Official Anthropic AI provider support for completion-driven workflows and
 structured JSON output.
+
+The default Claude API model is `claude-haiku-4-5-20251001`. The provider's
+built-in allowlist tracks current production model ids on Anthropic-operated
+surfaces; if a team needs to trial a newer id before the bundle is refreshed,
+set `allow_unknown_models=True` explicitly.
 
 | Component | Type | Description |
 |---|---|---|
@@ -118,7 +146,7 @@ Example:
 from agora.middlewares.ai.enrich import AIEnrichMiddleware
 from agora_plugins.anthropic import AnthropicProvider
 
-provider = AnthropicProvider(model="claude-3-5-haiku-20241022")
+provider = AnthropicProvider(model="claude-haiku-4-5-20251001")
 middleware = AIEnrichMiddleware(
     provider=provider,
     prompt_template="Review: {review_text}\nReturn JSON with keys summary and sentiment.",

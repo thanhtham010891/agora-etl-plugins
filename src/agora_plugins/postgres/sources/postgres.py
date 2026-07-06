@@ -365,6 +365,7 @@ class PostgresSource(BaseSource[T], Generic[T]):
             async with self._open_stream_cursor(conn) as cur:
                 await cur.execute(self._query, self._params if self._params else None)
                 while True:
+                    await self._enforce_active_replica_freshness(conn)
                     rows = await cur.fetchmany(self._batch_size)
                     if not rows:
                         break
@@ -481,31 +482,38 @@ class PostgresSource(BaseSource[T], Generic[T]):
 
         if self._on_replica_stale == "route_primary":
             await conn.close()
-            if count_staleness_events:
-                self._staleness_guard_primary_fallback_count += 1
             fallback_conn = await self._open_connection(
                 psycopg,
                 dict_row,
                 target_session_attrs=self._read_target_session_attrs("primary"),
             )
             fallback_role, fallback_replay_lag_s = await self._inspect_server_role(fallback_conn)
+            if fallback_role != "primary":
+                if count_staleness_events:
+                    self._staleness_guard_block_count += 1
+                self._set_server_observation(
+                    role=fallback_role,
+                    replay_lag_s=fallback_replay_lag_s,
+                    error=(
+                        "PostgresSource route_primary fallback did not resolve to a primary "
+                        f"server (connected role={fallback_role})."
+                    ),
+                )
+                await fallback_conn.close()
+                raise RuntimeError(
+                    "PostgresSource route_primary fallback must connect to a primary server."
+                )
+            if count_staleness_events:
+                self._staleness_guard_primary_fallback_count += 1
             return fallback_conn, fallback_role, fallback_replay_lag_s
 
-        if count_staleness_events:
-            self._staleness_guard_block_count += 1
-        self._set_server_observation(
+        await self._raise_replica_staleness(
             role=role,
             replay_lag_s=replay_lag_s,
-            error=(
-                "Postgres standby replay lag exceeded source staleness guard: "
-                f"{float(replay_lag_s or 0.0):.3f}s > {float(self._max_replica_replay_lag_s or 0.0):.3f}s"
-            ),
+            close_conn=conn,
+            count_staleness_events=count_staleness_events,
         )
-        await conn.close()
-        raise PostgresReplicaStalenessError(
-            replay_lag_s=float(replay_lag_s or 0.0),
-            max_replica_replay_lag_s=float(self._max_replica_replay_lag_s or 0.0),
-        )
+        raise AssertionError("unreachable")
 
     async def _open_connection(
         self,
@@ -553,6 +561,49 @@ class PostgresSource(BaseSource[T], Generic[T]):
         if replay_lag_s is None:
             return True
         return replay_lag_s > self._max_replica_replay_lag_s
+
+    async def _enforce_active_replica_freshness(self, conn: Any) -> None:
+        role, replay_lag_s = await self._inspect_server_role(conn)
+        if not self._replica_is_stale(role=role, replay_lag_s=replay_lag_s):
+            self._set_server_observation(
+                role=role,
+                replay_lag_s=replay_lag_s,
+                error=None,
+            )
+            return
+        await self._raise_replica_staleness(
+            role=role,
+            replay_lag_s=replay_lag_s,
+            close_conn=None,
+            count_staleness_events=True,
+        )
+
+    async def _raise_replica_staleness(
+        self,
+        *,
+        role: str,
+        replay_lag_s: float | None,
+        close_conn: Any | None,
+        count_staleness_events: bool,
+    ) -> None:
+        if count_staleness_events:
+            self._staleness_guard_block_count += 1
+        replay_lag_value = float(replay_lag_s or 0.0)
+        max_replay_lag_s = float(self._max_replica_replay_lag_s or 0.0)
+        self._set_server_observation(
+            role=role,
+            replay_lag_s=replay_lag_s,
+            error=(
+                "Postgres standby replay lag exceeded source staleness guard: "
+                f"{replay_lag_value:.3f}s > {max_replay_lag_s:.3f}s"
+            ),
+        )
+        if close_conn is not None:
+            await close_conn.close()
+        raise PostgresReplicaStalenessError(
+            replay_lag_s=replay_lag_value,
+            max_replica_replay_lag_s=max_replay_lag_s,
+        )
 
     def _read_target_session_attrs(
         self,

@@ -684,10 +684,11 @@ async def test_kafka_runtime_deliver_flush_false_waits_for_pending_acks_before_o
                     auto_offset_reset="earliest",
                     enable_auto_commit=False,
                     commit_every=1,
+                    max_idle_polls=2,
                 )
             )
             .build(redelivered)  # type: ignore[arg-type]
-            .run(max_records=1)
+            .run()
         ),
         timeout=_INTEGRATION_TIMEOUT_S,
     )
@@ -701,7 +702,7 @@ async def test_kafka_runtime_deliver_flush_false_waits_for_pending_acks_before_o
 
 
 @pytest.mark.asyncio
-async def test_kafka_poison_dlq_write_failure_does_not_advance_group_offset(
+async def test_kafka_poison_dlq_write_failure_advances_group_offset_when_policy_continues(
     kafka_bootstrap: str,
     unique_suffix: str,
 ) -> None:
@@ -739,6 +740,7 @@ async def test_kafka_poison_dlq_write_failure_does_not_advance_group_offset(
         auto_offset_reset="earliest",
         enable_auto_commit=False,
         commit_every=1,
+        max_idle_polls=2,
         poison_record_policy=KafkaPoisonRecordPolicy.DLQ_AND_CONTINUE,
         poison_record_sink=_FailingDLQSink(),
         poison_record_pipeline_id=f"agora-it-poison-{unique_suffix}",
@@ -747,8 +749,7 @@ async def test_kafka_poison_dlq_write_failure_does_not_advance_group_offset(
 
     await source.open()
     try:
-        with pytest.raises(RuntimeError, match="dlq unavailable"):
-            _ = [record async for record in source.stream()]
+        records = [record async for record in source.stream()]
         metrics = source.operational_metrics().to_dict()
         prometheus = await runtime.render_prometheus_metrics(namespace="agora_it_kafka")
     finally:
@@ -769,22 +770,23 @@ async def test_kafka_poison_dlq_write_failure_does_not_advance_group_offset(
                     auto_offset_reset="earliest",
                     enable_auto_commit=False,
                     commit_every=1,
+                    max_idle_polls=2,
                 )
             )
             .build(redelivered)  # type: ignore[arg-type]
-            .run(max_records=1)
+            .run()
         ),
         timeout=_INTEGRATION_TIMEOUT_S,
     )
 
+    assert records == []
     assert metrics["poison_record_dlq_write_count"] == 0
     assert metrics["poison_record_dlq_write_failure_count"] == 1
     assert metrics["poison_record_deserialization_count"] == 1
     assert 'event="poison_dlq_write_failure"} 1' in prometheus
     assert 'event="poison_classification_deserialization"} 1' in prometheus
-    assert redelivery_summary.records_consumed == 1
-    assert redelivered.records[0]["payload"] == "bad"
-    assert redelivered.records[0]["metadata"]["offset"] == 0
+    assert redelivery_summary.records_consumed == 0
+    assert redelivered.records == []
 
 
 @pytest.mark.asyncio

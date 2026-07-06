@@ -831,6 +831,7 @@ async def test_kafka_json_schema_failure_path_routes_to_poison_dlq_by_policy(
         registry_client=kafka_secure_schema_registry_config.schema_registry_client(),
         subject=subject,
         schema=schema_v2,
+        auto_register="always",
     )
 
     good_summary = await asyncio.wait_for(

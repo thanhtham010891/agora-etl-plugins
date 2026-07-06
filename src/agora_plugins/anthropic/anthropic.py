@@ -2,9 +2,15 @@
 
 Supported models
 ----------------
-- ``claude-3-5-haiku-20241022``  (default — fast, cheap, great for ETL)
-- ``claude-3-5-sonnet-20241022``
-- ``claude-3-opus-20240229``
+- ``claude-haiku-4-5-20251001``  (default — fast, cheap, great for ETL)
+- ``claude-sonnet-5``
+- ``claude-opus-4-8``
+- ``claude-fable-5``
+- ``claude-sonnet-4-6``
+- ``claude-sonnet-4-5-20250929``
+- ``claude-opus-4-7``
+- ``claude-opus-4-6``
+- ``claude-opus-4-5-20251101``
 
 Note: Anthropic does not provide native embedding models.
 Calling ``embed()`` on this provider raises ``NotImplementedError``.
@@ -32,7 +38,20 @@ if TYPE_CHECKING:
 
 logger = logstruct.getLogger(__name__)
 
-_DEFAULT_MODEL = "claude-3-5-haiku-20241022"
+_DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+_SUPPORTED_MODELS = frozenset(
+    {
+        "claude-fable-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-opus-4-5-20251101",
+        "claude-sonnet-5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-5-20250929",
+        "claude-haiku-4-5-20251001",
+    }
+)
 
 
 class AnthropicProvider:
@@ -45,6 +64,7 @@ class AnthropicProvider:
         *,
         api_key: str | None = None,
         model: str = _DEFAULT_MODEL,
+        allow_unknown_models: bool = False,
         max_retries: int = 5,
         retry_initial_backoff_s: float = 0.5,
         retry_max_backoff_s: float = 8.0,
@@ -65,6 +85,16 @@ class AnthropicProvider:
             raise ValueError(
                 "Anthropic API key is required. Pass api_key= or set ANTHROPIC_API_KEY env var."
             )
+        resolved_model = str(model).strip()
+        if not resolved_model:
+            raise ValueError("Anthropic model must be a non-empty string.")
+        if not allow_unknown_models and resolved_model not in _SUPPORTED_MODELS:
+            supported = ", ".join(sorted(_SUPPORTED_MODELS))
+            raise ValueError(
+                "Anthropic model must be one of the supported production model ids: "
+                f"{supported}. Got {resolved_model!r}. "
+                "Pass allow_unknown_models=True to opt into an unlisted model."
+            )
 
         self._anthropic_module = anthropic
         if request_timeout_s is not None and request_timeout_s <= 0:
@@ -80,7 +110,7 @@ class AnthropicProvider:
                 self._client = anthropic.AsyncAnthropic(api_key=resolved_key, max_retries=0)
             except TypeError:
                 self._client = anthropic.AsyncAnthropic(api_key=resolved_key)
-        self._model = model
+        self._model = resolved_model
         self._request_timeout_s = request_timeout_s
         self._retry_policy: RetryPolicy[Any] = RetryPolicy[Any](
             max_attempts=max(1, max_retries),
@@ -111,7 +141,7 @@ class AnthropicProvider:
         response_format: type[BaseModel] | None = None,
         cache_system_prompt: bool = False,
         cache_prompt: bool = False,
-        use_tool_for_response_format: bool = False,
+        use_tool_for_response_format: bool = True,
         repair_invalid_json: bool = True,
     ) -> CompletionResponse:
         kwargs = self._completion_kwargs(
@@ -196,6 +226,7 @@ class AnthropicProvider:
         response_format: type[BaseModel] | None = None,
         cache_system_prompt: bool = False,
         cache_prompt: bool = False,
+        use_tool_for_response_format: bool = True,
         use_message_batches_api: bool = False,
         message_batch_poll_interval_s: float = 5.0,
         message_batch_timeout_s: float | None = 24 * 60 * 60,
@@ -213,6 +244,7 @@ class AnthropicProvider:
                 response_format=response_format,
                 cache_system_prompt=cache_system_prompt,
                 cache_prompt=cache_prompt,
+                use_tool_for_response_format=use_tool_for_response_format,
             )
             batch_id = self._require_message_batch_id(batch)
             await self.wait_for_message_batch(
@@ -224,7 +256,7 @@ class AnthropicProvider:
                 batch_id,
                 expected_custom_ids=[f"agora-{idx}" for idx in range(len(prompts))],
                 response_format=response_format,
-                use_tool_for_response_format=False,
+                use_tool_for_response_format=use_tool_for_response_format,
                 repair_invalid_json=True,
             )
         return await asyncio.gather(
@@ -237,6 +269,7 @@ class AnthropicProvider:
                     response_format=response_format,
                     cache_system_prompt=cache_system_prompt,
                     cache_prompt=cache_prompt,
+                    use_tool_for_response_format=use_tool_for_response_format,
                 )
                 for prompt in prompts
             ]
@@ -252,6 +285,7 @@ class AnthropicProvider:
         response_format: type[BaseModel] | None = None,
         cache_system_prompt: bool = False,
         cache_prompt: bool = False,
+        use_tool_for_response_format: bool = True,
     ) -> Any:
         """Create an Anthropic Message Batch request and return the SDK response object."""
 
@@ -274,7 +308,7 @@ class AnthropicProvider:
                         response_format=response_format,
                         cache_system_prompt=cache_system_prompt,
                         cache_prompt=cache_prompt,
-                        use_tool_for_response_format=False,
+                        use_tool_for_response_format=use_tool_for_response_format,
                     ),
                 }
             )
@@ -338,7 +372,7 @@ class AnthropicProvider:
         *,
         expected_custom_ids: list[str],
         response_format: type[BaseModel] | None = None,
-        use_tool_for_response_format: bool = False,
+        use_tool_for_response_format: bool = True,
         repair_invalid_json: bool = True,
     ) -> list[CompletionResponse]:
         """Read Message Batch results and return completions in request order."""

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import struct
 import warnings
+from contextlib import asynccontextmanager, suppress
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -16,6 +17,8 @@ from agora.utils.math import cosine_similarity as _cosine_similarity
 from agora_plugins.redis.connection import RedisClusterAddressRemap, build_async_redis_client
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Callable
+
     from agora.ai.providers.base import EmbeddingProvider
     from redis.asyncio import Redis as AsyncRedis
 
@@ -28,6 +31,8 @@ _DEFAULT_MAX_ENTRIES = 10_000
 _SCAN_COUNT = 256
 _INDEX_KEY_SUFFIX = "__index__"
 _RESERVED_KEYS = frozenset({_INDEX_KEY_SUFFIX, "__lock__"})
+_LOCK_RENEWAL_MIN_INTERVAL_S = 0.05
+_LOCK_RENEWAL_MAX_INTERVAL_S = 1.0
 
 
 class RedisEmbeddingStore(DedupStore[str]):
@@ -122,11 +127,18 @@ class RedisEmbeddingStore(DedupStore[str]):
             lock_key,
             timeout=self._lock_timeout_s,
             blocking_timeout=self._lock_blocking_timeout_s,
+            raise_on_release_error=False,
         )
-        async with self._mark_lock, lock:
-            if await self._redis_exists(query_embedding=embedding):
+        async with self._mark_lock, lock, self._renew_mark_lock(lock) as ensure_lock_healthy:
+            if await self._redis_exists(
+                query_embedding=embedding,
+                on_scan_step=ensure_lock_healthy,
+            ):
+                ensure_lock_healthy()
                 return False
+            ensure_lock_healthy()
             await self._redis_add(key, embedding, ttl_seconds=ttl_seconds)
+            ensure_lock_healthy()
             return True
 
     async def close(self) -> None:
@@ -200,7 +212,12 @@ class RedisEmbeddingStore(DedupStore[str]):
             pipe.sadd(index_key, key)
             await pipe.execute()
 
-    async def _redis_exists(self, query_embedding: list[float]) -> bool:
+    async def _redis_exists(
+        self,
+        query_embedding: list[float],
+        *,
+        on_scan_step: Callable[[], None] | None = None,
+    ) -> bool:
         if self._use_redisearch:
             return await self._redisearch_exists(query_embedding)
 
@@ -208,6 +225,8 @@ class RedisEmbeddingStore(DedupStore[str]):
         index_key = f"{self._redis_prefix}{_INDEX_KEY_SUFFIX}"
         cursor = 0
         while True:
+            if on_scan_step is not None:
+                on_scan_step()
             cursor, batch_keys = await redis.sscan(index_key, cursor=cursor, count=_SCAN_COUNT)
             if batch_keys:
                 stored_keys = [k.decode() if isinstance(k, bytes) else k for k in batch_keys]
@@ -217,6 +236,8 @@ class RedisEmbeddingStore(DedupStore[str]):
                     for fk in field_keys:
                         pipe.get(fk)
                     packed_values = await pipe.execute()
+                if on_scan_step is not None:
+                    on_scan_step()
 
                 for stored_key, packed in zip(stored_keys, packed_values, strict=True):
                     if packed is None:
@@ -252,6 +273,51 @@ class RedisEmbeddingStore(DedupStore[str]):
             if cursor == 0:
                 break
         return False
+
+    @asynccontextmanager
+    async def _renew_mark_lock(self, lock: Any) -> AsyncIterator[Callable[[], None]]:
+        renewal_error: Exception | None = None
+        interval_s = self._mark_lock_renewal_interval_s()
+
+        def _ensure_lock_healthy() -> None:
+            if renewal_error is not None:
+                raise RuntimeError(
+                    "RedisEmbeddingStore lost the distributed mark lock during mark_if_new()."
+                ) from renewal_error
+
+        async def _renew_loop() -> None:
+            nonlocal renewal_error
+            try:
+                while True:
+                    await asyncio.sleep(interval_s)
+                    renewed = await lock.reacquire()
+                    if renewed is False:
+                        raise RuntimeError(
+                            "RedisEmbeddingStore could not renew the distributed mark lock."
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                renewal_error = exc
+
+        task = asyncio.create_task(
+            _renew_loop(),
+            name="agora-redis-embedding-lock-renewal",
+        )
+        try:
+            yield _ensure_lock_healthy
+            _ensure_lock_healthy()
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            _ensure_lock_healthy()
+
+    def _mark_lock_renewal_interval_s(self) -> float:
+        return max(
+            min(self._lock_timeout_s / 3.0, _LOCK_RENEWAL_MAX_INTERVAL_S),
+            _LOCK_RENEWAL_MIN_INTERVAL_S,
+        )
 
     async def _redis_prune_stale_index_entries(self, redis: Any, index_key: str) -> None:
         cursor = 0

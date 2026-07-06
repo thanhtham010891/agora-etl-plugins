@@ -138,6 +138,10 @@ def _acked_ids(client: _FakeRedisClient) -> list[str]:
     return ids
 
 
+async def _noop_async() -> None:
+    return None
+
+
 class _CountSink:
     sink_name = "count"
 
@@ -160,6 +164,25 @@ class _CountSink:
 
 class _CollectSink:
     sink_name = "collect"
+
+    def __init__(self) -> None:
+        self.records: list[object] = []
+
+    async def open(self) -> None:
+        return None
+
+    async def write(self, record: object) -> None:
+        self.records.append(record)
+
+    async def flush(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+
+class _CollectDLQSink:
+    sink_name = "dlq"
 
     def __init__(self) -> None:
         self.records: list[object] = []
@@ -491,7 +514,7 @@ async def test_redis_stream_source_resume_rejects_multi_consumer_group() -> None
 
 
 @pytest.mark.asyncio
-async def test_redis_stream_source_does_not_ack_bad_messages_when_ack_disabled() -> None:
+async def test_redis_stream_source_acknowledges_dropped_bad_messages_when_ack_disabled() -> None:
     source = RedisStreamSource(
         url="redis://localhost:6379",
         stream="events",
@@ -521,7 +544,7 @@ async def test_redis_stream_source_does_not_ack_bad_messages_when_ack_disabled()
             await _ack_delivery(source)
 
     assert records == [2]
-    assert _acked_ids(client) == []
+    assert _acked_ids(client) == ["1-0"]
     assert source.runtime_metrics().to_dict() == {
         "record_error_count": 1,
         "record_drop_count": 1,
@@ -709,9 +732,7 @@ async def test_redis_stream_source_reconnect_uses_configured_retry_policy() -> N
 
 
 @pytest.mark.asyncio
-async def test_redis_stream_source_surfaces_poison_loop_risk_for_reclaimed_unacked_messages() -> (
-    None
-):
+async def test_redis_stream_source_acknowledges_reclaimed_poison_with_log_and_continue() -> None:
     source = RedisStreamSource(
         url="redis://localhost:6379",
         stream="events",
@@ -727,7 +748,6 @@ async def test_redis_stream_source_surfaces_poison_loop_risk_for_reclaimed_unack
         [],
         reclaimed_batches=[
             [("1-0", {"value": "bad"})],
-            [("1-0", {"value": "bad"})],
         ],
     )
     source._client = client  # type: ignore[attr-defined]
@@ -740,29 +760,52 @@ async def test_redis_stream_source_surfaces_poison_loop_risk_for_reclaimed_unack
     report = source.acceptance_report()
     rendered = source.render_prometheus_metrics(namespace="agora_test_redis")
 
-    assert metrics.reclaimed_message_count == 2
-    assert metrics.record_error_count == 2
-    assert metrics.record_drop_count == 2
-    assert metrics.poison_loop_risk.detected is True
-    assert metrics.poison_loop_risk.loop_count == 2
-    assert metrics.poison_loop_risk.distinct_message_count == 1
-    assert metrics.poison_loop_risk.last_message_id == "1-0"
-    assert metrics.poison_loop_risk.last_detected_at is not None
-    assert report.passed is False
+    assert metrics.reclaimed_message_count == 1
+    assert metrics.record_error_count == 1
+    assert metrics.record_drop_count == 1
+    assert metrics.acked_message_count == 1
+    assert metrics.poison_loop_risk.detected is False
+    assert metrics.poison_loop_risk.loop_count == 0
+    assert metrics.poison_loop_risk.distinct_message_count == 0
+    assert metrics.poison_loop_risk.last_message_id is None
+    assert metrics.poison_loop_risk.last_detected_at is None
     assert isinstance(report, AcceptanceReport)
     assert all(isinstance(finding, AcceptanceFinding) for finding in report.findings)
-    assert any(
-        finding.metric == "poison_loop_count" and finding.value == 2 and finding.threshold == 0
-        for finding in report.findings
-    )
+    assert not any(finding.metric == "poison_loop_count" for finding in report.findings)
+    assert _acked_ids(client) == ["1-0"]
     assert (
         "agora_test_redis_source_state"
-        '{stream="events",group="g",consumer="c",state="poison_loop_risk"} 1'
+        '{stream="events",group="g",consumer="c",state="poison_loop_risk"} 0'
     ) in rendered
     assert (
         "agora_test_redis_source_events_total"
-        '{stream="events",group="g",consumer="c",event="poison_loop"} 2'
+        '{stream="events",group="g",consumer="c",event="poison_loop"} 0'
     ) in rendered
+
+
+@pytest.mark.asyncio
+async def test_redis_stream_source_acknowledges_reclaimed_poison_after_dlq_route() -> None:
+    source = RedisStreamSource(
+        url="redis://localhost:6379",
+        stream="events",
+        group="g",
+        consumer="c",
+        deserializer=lambda fields: int(fields["value"]),
+        reclaim_idle_ms=60_000,
+        reclaim_batch_size=1,
+    )
+    client = _FakeRedisClient([], reclaimed_batches=[[("1-0", {"value": "bad"})]])
+    dlq = _CollectDLQSink()
+    sink = _CollectSink()
+    source._client = client  # type: ignore[attr-defined]
+    source.open = _noop_async  # type: ignore[method-assign]
+    source.close = _noop_async  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="invalid literal for int"):
+        await Pipeline(source).build(sink, config=DeliveryConfig(dlq=dlq)).run(max_records=1)  # type: ignore[arg-type]
+
+    assert _acked_ids(client) == ["1-0"]
+    assert len(dlq.records) == 1
 
 
 @pytest.mark.asyncio

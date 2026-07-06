@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.4.1 (July 6, 2026)
+
+- Hardened Redis stream poison-record handling so reclaimed deserialize
+  failures are acknowledged once `LOG_AND_CONTINUE` or DLQ routing has handled
+  them, preventing pending-message poison loops and keeping Redis stream
+  recovery state consistent.
+- Reworked Redis DLQ index maintenance to use atomic Lua upsert and
+  acknowledge flows, including Redis Cluster-safe key tagging and legacy index
+  fallback during reads and acknowledgements.
+- Hardened `RedisEmbeddingStore` distributed marking so long-running semantic
+  scans renew the cross-worker lock and fail closed if the lock can no longer
+  be renewed before writing dedup markers.
+- Made `fallback_to_local` lease handling internally consistent in
+  `RedisWorkerCoordinator`, including local acquire, validate, renew, and
+  release behavior when Redis coordination is unavailable.
+- Tightened Redlock fencing so one authoritative token is reserved on the
+  primary Redis connection and the same token is validated across quorum-node
+  acquire, renew, release, and lease-check flows.
+- Made PostgreSQL sink batch writes and `ALIGN_TO_TARGET` flushes atomic across
+  SQL, COPY, and COPY-merge paths so late write failures roll back the full
+  buffered flush instead of partially committing aligned rows.
+- Hardened PostgreSQL source replica-staleness guards so primary-only fallback
+  rejects non-primary connections and active standby streams fail closed if
+  replay lag exceeds the configured budget mid-stream.
+- Changed Kafka poison-record handling so `DLQ_AND_CONTINUE` keeps progress on
+  handled records even when the DLQ write itself fails, while
+  `DLQ_AND_FAIL_CLOSED` still blocks advancement.
+- Bounded Kafka Schema Registry deserializer caches, normalized schema
+  comparisons more strictly, and changed default auto-registration to only
+  bootstrap missing subjects instead of always registering new versions.
+- Hardened the Anthropic provider around supported-model validation,
+  structured-output repair, truncated responses, retry-after aware retry
+  behavior, and refreshed default/allowlisted Claude model ids away from
+  retired 3.x-era snapshots.
+- Refreshed package README and security wording so the public narrative stays
+  aligned with `agora-etl-plugins` as the official first-party plugin package.
+
 ## 0.4.0 (June 17, 2026)
 
 - Moved `agora-etl-plugins` onto the `agora-etl 0.4.x` compatibility line with

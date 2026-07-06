@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast
 import logstruct
 from agora.core.dlq import DLQRecord, DLQSink
 from agora.core.failures import PoisonRecordClassification, PoisonRecordInfo
-from agora.core.retry import RetryPolicy
+from agora.core.retry import RetryPolicy, retry_async
 from agora.core.sink import BaseSink
 
 from agora_plugins.postgres.connection import (
@@ -50,6 +50,9 @@ from agora_plugins.postgres.sinks._pool import (
 )
 from agora_plugins.postgres.sinks._write_plan import PostgresWritePlanner
 from agora_plugins.postgres.sinks._write_strategies import (
+    execute_copy_batch,
+    execute_copy_merge_batch,
+    execute_sql_batch,
     flush_via_copy,
     flush_via_copy_merge,
     flush_via_sql,
@@ -729,6 +732,7 @@ class PostgresSink(BaseSink[T], Generic[T]):
         if not self._buffer:
             return
 
+        await self._load_psycopg()
         started = time.perf_counter()
         rows = list(self._buffer)
         count = len(rows)
@@ -741,16 +745,24 @@ class PostgresSink(BaseSink[T], Generic[T]):
             raise self._wrap_write_error(exc, rows=rows, columns=columns) from exc
         flushed_indexes: set[int] = set()
         try:
-            for batch in batches:
-                columns = list(batch.columns)
-                batch_rows = list(batch.rows)
-                if self._insert_mode == "copy":
-                    await self._flush_via_copy(batch_rows, columns, len(batch_rows), policy)
-                elif self._insert_mode == "copy_merge":
-                    await self._flush_via_copy_merge(batch_rows, columns, len(batch_rows), policy)
-                else:
-                    await self._flush_via_sql(batch_rows, columns, len(batch_rows), policy)
-                flushed_indexes.update(batch.row_indexes)
+            if (
+                self._write_safety_policy == PostgresWriteSafetyPolicy.ALIGN_TO_TARGET
+                and len(batches) > 1
+            ):
+                await self._flush_aligned_batches_atomically(batches, rows, policy)
+            else:
+                for batch in batches:
+                    columns = list(batch.columns)
+                    batch_rows = list(batch.rows)
+                    if self._insert_mode == "copy":
+                        await self._flush_via_copy(batch_rows, columns, len(batch_rows), policy)
+                    elif self._insert_mode == "copy_merge":
+                        await self._flush_via_copy_merge(
+                            batch_rows, columns, len(batch_rows), policy
+                        )
+                    else:
+                        await self._flush_via_sql(batch_rows, columns, len(batch_rows), policy)
+                    flushed_indexes.update(batch.row_indexes)
         except Exception:
             self._discard_buffer_indexes(flushed_indexes)
             self._observe_latency("flush", "error", time.perf_counter() - started)
@@ -794,6 +806,66 @@ class PostgresSink(BaseSink[T], Generic[T]):
         policy: RetryPolicy[Any],
     ) -> None:
         await flush_via_copy_merge(self, rows, columns, count, policy)
+
+    async def _flush_aligned_batches_atomically(
+        self,
+        batches: list[_PreparedWriteBatch],
+        rows: list[dict[str, Any]],
+        policy: RetryPolicy[Any],
+    ) -> None:
+        count = len(rows)
+
+        def _on_retry(attempt: int, exc: Exception, delay: float) -> None:
+            logger.warning(
+                "postgres_flush_retry",
+                table=self._table,
+                count=count,
+                attempt=attempt,
+                wait_s=delay,
+                error=str(exc),
+            )
+            self._observe_retry()
+
+        async def _execute_flush() -> None:
+            async with self._write_connection() as conn:
+                try:
+                    for batch in batches:
+                        batch_rows = list(batch.rows)
+                        columns = list(batch.columns)
+                        if self._insert_mode == "copy":
+                            await execute_copy_batch(self, conn, batch_rows, columns)
+                        elif self._insert_mode == "copy_merge":
+                            await execute_copy_merge_batch(self, conn, batch_rows, columns)
+                        else:
+                            await execute_sql_batch(self, conn, batch_rows, columns)
+                    await conn.commit()
+                except Exception:
+                    try:
+                        await conn.rollback()
+                    except Exception:
+                        logger.exception(
+                            "postgres_rollback_error",
+                            table=self._table,
+                            count=count,
+                        )
+                    raise
+
+        try:
+            if self._insert_mode == "copy":
+                await _execute_flush()
+            else:
+                await retry_async(
+                    _execute_flush,
+                    policy=policy,
+                    on_retry=_on_retry,
+                )
+        except Exception as exc:
+            logger.exception("postgres_flush_error", table=self._table, count=count)
+            raise self._wrap_write_error(
+                exc,
+                rows=rows,
+                columns=list(rows[0].keys()),
+            ) from exc
 
     def _observe_retry(self) -> None:
         self._retry_count += 1

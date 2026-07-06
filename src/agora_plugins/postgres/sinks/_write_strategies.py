@@ -92,11 +92,7 @@ async def flush_via_sql(
     async def _execute_flush() -> None:
         async with owner._write_connection() as conn:
             try:
-                async with conn.cursor() as cur:
-                    for chunk in owner._iter_sql_chunks(rows, columns):
-                        sql = owner._build_batch_upsert_sql(columns, row_count=len(chunk))
-                        params = owner._flatten_rows(chunk, columns)
-                        await cur.execute(sql, params)
+                await execute_sql_batch(owner, conn, rows, columns)
                 await conn.commit()
             except Exception:
                 try:
@@ -126,14 +122,10 @@ async def flush_via_copy(
     columns: list[str],
     count: int,
 ) -> None:
-    sql = owner._build_copy_sql(columns)
-
     async def _execute_copy() -> None:
         async with owner._write_connection() as conn:
             try:
-                async with conn.cursor() as cur, cur.copy(sql) as copy:
-                    for row in rows:
-                        await copy.write_row([row[column] for column in columns])
+                await execute_copy_batch(owner, conn, rows, columns)
                 await conn.commit()
             except Exception:
                 try:
@@ -179,13 +171,16 @@ async def flush_via_copy_merge(
     async def _execute_copy_merge() -> None:
         async with owner._write_connection() as conn:
             try:
-                async with conn.cursor() as cur:
-                    await cur.execute(create_sql)
-                async with conn.cursor() as cur, cur.copy(copy_sql) as copy:
-                    for row in rows:
-                        await copy.write_row([row[column] for column in columns])
-                async with conn.cursor() as cur:
-                    await cur.execute(merge_sql)
+                await execute_copy_merge_batch(
+                    owner,
+                    conn,
+                    rows,
+                    columns,
+                    staging_table=staging_table,
+                    create_sql=create_sql,
+                    copy_sql=copy_sql,
+                    merge_sql=merge_sql,
+                )
                 await conn.commit()
             except Exception:
                 try:
@@ -207,3 +202,52 @@ async def flush_via_copy_merge(
     except Exception as exc:
         logger.exception("postgres_copy_merge_error", table=owner._table, count=count)
         raise owner._wrap_write_error(exc, rows=rows, columns=columns) from exc
+
+
+async def execute_sql_batch(
+    owner: PostgresWriteOwner,
+    conn: Any,
+    rows: list[dict[str, Any]],
+    columns: list[str],
+) -> None:
+    async with conn.cursor() as cur:
+        for chunk in owner._iter_sql_chunks(rows, columns):
+            sql = owner._build_batch_upsert_sql(columns, row_count=len(chunk))
+            params = owner._flatten_rows(chunk, columns)
+            await cur.execute(sql, params)
+
+
+async def execute_copy_batch(
+    owner: PostgresWriteOwner,
+    conn: Any,
+    rows: list[dict[str, Any]],
+    columns: list[str],
+) -> None:
+    sql = owner._build_copy_sql(columns)
+    async with conn.cursor() as cur, cur.copy(sql) as copy:
+        for row in rows:
+            await copy.write_row([row[column] for column in columns])
+
+
+async def execute_copy_merge_batch(
+    owner: PostgresWriteOwner,
+    conn: Any,
+    rows: list[dict[str, Any]],
+    columns: list[str],
+    *,
+    staging_table: str | None = None,
+    create_sql: str | None = None,
+    copy_sql: str | None = None,
+    merge_sql: str | None = None,
+) -> None:
+    resolved_staging_table = staging_table or owner._build_stage_table_name()
+    resolved_create_sql = create_sql or owner._build_create_temp_table_sql(resolved_staging_table)
+    resolved_copy_sql = copy_sql or owner._build_copy_sql_for_table(resolved_staging_table, columns)
+    resolved_merge_sql = merge_sql or owner._build_copy_merge_sql(columns, resolved_staging_table)
+    async with conn.cursor() as cur:
+        await cur.execute(resolved_create_sql)
+    async with conn.cursor() as cur, cur.copy(resolved_copy_sql) as copy:
+        for row in rows:
+            await copy.write_row([row[column] for column in columns])
+    async with conn.cursor() as cur:
+        await cur.execute(resolved_merge_sql)

@@ -1,6 +1,6 @@
 # Security Policy
 
-`agora-etl-plugins` is the official first-party plugin bundle for Agora's
+`agora-etl-plugins` is the official first-party plugin package for Agora's
 production integrations. This policy covers security issues in the plugin
 package itself, including Redis, Kafka, PostgreSQL, cron, distributed
 coordination, and Anthropic provider surfaces.

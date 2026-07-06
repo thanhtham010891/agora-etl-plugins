@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agora-etl-plugins"
-version = "0.4.0"
+version = "0.4.1"
 description = "Official plugins for agora-etl — Redis, cron scheduling, distributed coordination, Kafka, PostgreSQL, and Anthropic AI support."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -29,7 +29,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/thanhtham010891/agora-etl-plugins"
-Documentation = "https://github.com/thanhtham010891/agora-etl/blob/main/packages/agora/docs/plugins/index.md"
+Documentation = "https://github.com/thanhtham010891/agora-etl/blob/main/docs/plugins/index.md"
 Repository = "https://github.com/thanhtham010891/agora-etl-plugins"
 BugTracker = "https://github.com/thanhtham010891/agora-etl-plugins/issues"
 

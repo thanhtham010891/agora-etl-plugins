@@ -797,6 +797,79 @@ async def test_flush_retries_transient_database_errors() -> None:
 
 
 @pytest.mark.asyncio
+async def test_flush_uses_default_psycopg_retry_policy_on_first_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeOperationalError(Exception):
+        pass
+
+    sink = PostgresSink(
+        dsn="postgresql://example.invalid/db",
+        table="events",
+        row_mapper=lambda row: row,
+        conflict_key="slug",
+    )
+    sink._buffer = [  # type: ignore[attr-defined]
+        {"slug": "a", "display_name": "A"},
+    ]
+
+    class FakeCursor:
+        def __init__(self) -> None:
+            self.execute_calls = 0
+
+        async def execute(self, sql: str, params: list[Any]) -> None:
+            del sql, params
+            self.execute_calls += 1
+            if self.execute_calls == 1:
+                raise FakeOperationalError("transient db error")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class FakeConn:
+        def __init__(self) -> None:
+            self.cursor_obj = FakeCursor()
+            self.commit_calls = 0
+            self.rollback_calls = 0
+
+        def cursor(self) -> FakeCursor:
+            return self.cursor_obj
+
+        async def commit(self) -> None:
+            self.commit_calls += 1
+
+        async def rollback(self) -> None:
+            self.rollback_calls += 1
+
+    conn = FakeConn()
+
+    class _AsyncConnection:
+        @staticmethod
+        async def connect(*args, **kwargs):
+            del args, kwargs
+            return conn
+
+    fake_psycopg = SimpleNamespace(
+        AsyncConnection=_AsyncConnection,
+        OperationalError=FakeOperationalError,
+        InterfaceError=RuntimeError,
+    )
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    await sink.flush()
+
+    assert sink._psycopg is fake_psycopg  # type: ignore[attr-defined]
+    assert conn.cursor_obj.execute_calls == 2
+    assert conn.rollback_calls == 1
+    assert conn.commit_calls == 1
+    assert sink.metrics_snapshot().retry_count == 1
+    assert sink._buffer == []  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_flush_aligns_rows_to_live_target_schema_and_drops_unknown_columns() -> None:
     sink = PostgresSink(
         dsn="postgresql://example.invalid/db",
@@ -970,7 +1043,7 @@ async def test_auto_flush_failure_routes_failed_buffer_to_dlq() -> None:
 
 
 @pytest.mark.asyncio
-async def test_partial_align_to_target_flush_dlqs_only_unflushed_rows() -> None:
+async def test_partial_align_to_target_flush_rolls_back_all_rows_on_late_failure() -> None:
     dlq = _CollectDLQSink()
     sink = PostgresSink(
         dsn="postgresql://example.invalid/db",
@@ -1000,33 +1073,57 @@ async def test_partial_align_to_target_flush_dlqs_only_unflushed_rows() -> None:
             ),
         ]
 
-    flush_calls = 0
+    class FakeCursor:
+        def __init__(self) -> None:
+            self.execute_calls = 0
 
-    async def _fake_flush_via_sql(
-        rows: list[dict[str, Any]],
-        columns: list[str],
-        count: int,
-        policy: RetryPolicy[Any],
-    ) -> None:
-        nonlocal flush_calls
-        del columns, count, policy
-        flush_calls += 1
-        if flush_calls == 2:
-            raise sink._wrap_write_error(  # type: ignore[attr-defined]
-                RuntimeError("second batch failed"),
-                rows=rows,
-                columns=list(rows[0]),
-            )
+        async def execute(self, sql: str, params: list[Any]) -> None:
+            del sql, params
+            self.execute_calls += 1
+            if self.execute_calls == 2:
+                raise RuntimeError("second batch failed")
 
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class FakeConn:
+        def __init__(self) -> None:
+            self.cursor_obj = FakeCursor()
+            self.commit_calls = 0
+            self.rollback_calls = 0
+
+        def cursor(self) -> FakeCursor:
+            return self.cursor_obj
+
+        async def commit(self) -> None:
+            self.commit_calls += 1
+
+        async def rollback(self) -> None:
+            self.rollback_calls += 1
+
+    conn = FakeConn()
+    sink._conn = conn  # type: ignore[attr-defined]
     sink._load_target_columns = _fake_load_target_columns  # type: ignore[method-assign]
-    sink._flush_via_sql = _fake_flush_via_sql  # type: ignore[method-assign]
 
     with pytest.raises(PostgresSinkWriteError, match="second batch failed") as exc_info:
         await sink.flush()
 
-    assert sink._buffer == [{"slug": "b"}]  # type: ignore[attr-defined]
+    assert conn.commit_calls == 0
+    assert conn.rollback_calls == 1
+    assert sink._buffer == [  # type: ignore[attr-defined]
+        {"slug": "a", "display_name": "A"},
+        {"slug": "b"},
+        {"slug": "c", "display_name": "C"},
+    ]
     await sink._route_failed_buffer_to_dlq(exc_info.value)  # type: ignore[attr-defined]
-    assert [record.record for record in dlq.records] == [{"slug": "b"}]
+    assert [record.record for record in dlq.records] == [  # type: ignore[list-item]
+        {"slug": "a", "display_name": "A"},
+        {"slug": "b"},
+        {"slug": "c", "display_name": "C"},
+    ]
     assert sink._buffer == []  # type: ignore[attr-defined]
 
 

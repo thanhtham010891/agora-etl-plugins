@@ -463,11 +463,11 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
                     )
                     if self._on_deserialize_error == SourceRecordFailurePolicy.LOG_AND_CONTINUE:
                         self._record_drop_count += 1
-                        if self._ack_on_success:
-                            await self._enqueue_ack(msg_id)
+                        await self._enqueue_ack(msg_id)
                         continue
+                    on_handled = self._build_failure_ack_callback(msg_id) if was_reclaimed else None
                     await self._flush_pending_acks()
-                    raise SourceRecordError(
+                    source_error = SourceRecordError(
                         exc,
                         record={
                             "message_id": normalized_message_id,
@@ -477,7 +477,12 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
                         },
                         checkpoint=self.current_checkpoint(),
                         source=self.source_name,
-                    ) from exc
+                    )
+                    if on_handled is not None:
+                        # Older agora-etl 0.4.1 builds do not accept the callback in the
+                        # constructor, so attach it after instantiation for compatibility.
+                        object.__setattr__(source_error, "on_handled", on_handled)
+                    raise source_error from exc
 
                 self._delivery_success_hook = self._build_ack_callback(msg_id)
                 self._emitted_record_count += 1
@@ -491,6 +496,18 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
             if self._client is None:
                 raise RuntimeError("RedisStreamSource client is closed — cannot ack message")
             await self._enqueue_ack(msg_id)
+
+        return _ack
+
+    def _build_failure_ack_callback(self, msg_id: str | bytes) -> Callable[[], Awaitable[None]]:
+        async def _ack() -> None:
+            client = self._client
+            if client is None:
+                raise RuntimeError("RedisStreamSource client is closed — cannot ack message")
+            await client.xack(self._stream, self._group, msg_id)
+            self._ack_flush_count += 1
+            self._acked_message_count += 1
+            self._last_ack_at = _now_utc()
 
         return _ack
 
@@ -642,10 +659,7 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
             raise last_error
 
     def _will_ack_failed_record(self) -> bool:
-        return (
-            self._on_deserialize_error == SourceRecordFailurePolicy.LOG_AND_CONTINUE
-            and self._ack_on_success
-        )
+        return self._on_deserialize_error == SourceRecordFailurePolicy.LOG_AND_CONTINUE
 
     async def _apply_resume_checkpoint(self, client: Any) -> None:
         if not self._resume_group_seek_pending or self._resume_cursor is None:

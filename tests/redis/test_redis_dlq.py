@@ -74,6 +74,8 @@ class _FakeAsyncRedis:
         self.closed = False
         self.lrange_calls: list[tuple[str, int, int]] = []
         self.exists_calls: list[str] = []
+        self.upsert_script = _FakeDLQUpsertScript(self)
+        self.acknowledge_script = _FakeDLQAcknowledgeScript(self)
 
     async def hset(self, key: str, *, mapping: dict[str, str]) -> None:
         self.hashes.setdefault(key, {}).update(mapping)
@@ -106,8 +108,70 @@ class _FakeAsyncRedis:
         assert transaction in {False, True}
         return _FakePipeline(self)
 
+    def register_script(self, script: str):
+        if "REDIS_DLQ_UPSERT" in script:
+            return self.upsert_script
+        if "REDIS_DLQ_ACKNOWLEDGE" in script:
+            return self.acknowledge_script
+        raise AssertionError(f"unexpected script registration: {script[:40]!r}")
+
     async def aclose(self) -> None:
         self.closed = True
+
+
+class _FakeDLQUpsertScript:
+    def __init__(self, client: _FakeAsyncRedis) -> None:
+        self._client = client
+        self.calls: list[tuple[list[str], list[str]]] = []
+
+    async def __call__(self, *, keys: list[str], args: list[str]) -> int:
+        self.calls.append((keys, args))
+        record_key, primary_index, pipeline_index, stage_index, pipeline_stage_index = keys
+        field_count = int(args[0])
+        mapping = {args[index]: args[index + 1] for index in range(1, field_count * 2 + 1, 2)}
+        existing_payload = dict(self._client.hashes.get(record_key, {}))
+        inserted = int(not existing_payload)
+        self._client.hashes[record_key] = mapping
+        if inserted:
+            self._client.lists.setdefault(primary_index, []).append(record_key)
+        else:
+            old_secondary_keys = {
+                existing_payload.get("__pipeline_index_key"),
+                existing_payload.get("__stage_index_key"),
+                existing_payload.get("__pipeline_stage_index_key"),
+            } - {None}
+            for index_key in old_secondary_keys | {
+                pipeline_index,
+                stage_index,
+                pipeline_stage_index,
+            }:
+                self._client.lists[index_key] = [
+                    item for item in self._client.lists.get(index_key, []) if item != record_key
+                ]
+        for index_key in (pipeline_index, stage_index, pipeline_stage_index):
+            self._client.lists.setdefault(index_key, []).append(record_key)
+        return inserted
+
+
+class _FakeDLQAcknowledgeScript:
+    def __init__(self, client: _FakeAsyncRedis) -> None:
+        self._client = client
+        self.calls: list[tuple[list[str], list[str]]] = []
+
+    async def __call__(self, *, keys: list[str], args: list[str]) -> int:
+        self.calls.append((keys, args))
+        record_key, primary_index, pipeline_index, stage_index, pipeline_stage_index = keys
+        payload = self._client.hashes.pop(record_key, {})
+        for index_key in (
+            primary_index,
+            payload.get("__pipeline_index_key") or pipeline_index,
+            payload.get("__stage_index_key") or stage_index,
+            payload.get("__pipeline_stage_index_key") or pipeline_stage_index,
+        ):
+            self._client.lists[index_key] = [
+                item for item in self._client.lists.get(index_key, []) if item != record_key
+            ]
+        return 1
 
 
 def _install_fake_async_redis(monkeypatch: pytest.MonkeyPatch, client: _FakeAsyncRedis) -> None:
@@ -117,7 +181,16 @@ def _install_fake_async_redis(monkeypatch: pytest.MonkeyPatch, client: _FakeAsyn
             del url, kwargs
             return client
 
-    fake_module = SimpleNamespace(from_url=_RedisFactory.from_url)
+    class _RedisClusterFactory:
+        @staticmethod
+        def from_url(url: str, **kwargs: object):
+            del url, kwargs
+            return client
+
+    fake_module = SimpleNamespace(
+        from_url=_RedisFactory.from_url,
+        RedisCluster=_RedisClusterFactory,
+    )
     monkeypatch.setitem(sys.modules, "redis", SimpleNamespace(asyncio=fake_module))
     monkeypatch.setitem(sys.modules, "redis.asyncio", fake_module)
 
@@ -427,7 +500,10 @@ async def test_redis_dlq_source_falls_back_to_primary_index_for_legacy_records(
     records = [record async for record in source.stream()]
 
     assert [record.pipeline_id for record in records] == ["orders"]
-    assert client.exists_calls == ["agora:test:dlq:__index__:pipeline_stage:orders:sink_write"]
+    assert client.exists_calls == [
+        "agora:test:dlq:__index__:pipeline_stage:orders:sink_write",
+        "agora:test:dlq:__index__",
+    ]
     assert client.lrange_calls == [("agora:test:dlq:__index__", 0, -1)]
 
 
@@ -498,6 +574,119 @@ async def test_redis_dlq_rewrite_existing_storage_key_does_not_duplicate_index(
     assert metrics.inserted_record_count == 1
     assert metrics.upserted_record_count == 2
     assert metrics.updated_record_count == 1
+
+
+@pytest.mark.asyncio
+async def test_redis_dlq_rewrite_existing_storage_key_moves_secondary_indexes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeAsyncRedis()
+    _install_fake_async_redis(monkeypatch, client)
+    sink = RedisDLQSink(url="redis://localhost:6379", key_prefix="agora:test:dlq")
+    record = _make_record()
+
+    await sink.open()
+    await sink.write(record)
+    await sink.write(_make_record(stage="sink_retry", _storage_id=cast("str", record._storage_id)))
+
+    record_key = cast("str", record._storage_id)
+    assert client.lists["agora:test:dlq:__index__"] == [record_key]
+    assert client.lists["agora:test:dlq:__index__:stage:sink_write"] == []
+    assert client.lists["agora:test:dlq:__index__:stage:sink_retry"] == [record_key]
+
+
+@pytest.mark.asyncio
+async def test_redis_dlq_cluster_uses_tagged_keys_for_atomic_scripts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeAsyncRedis()
+    _install_fake_async_redis(monkeypatch, client)
+    sink = RedisDLQSink(
+        url="redis://localhost:6379",
+        key_prefix="agora:test:dlq",
+        redis_cluster=True,
+    )
+    source = RedisDLQSource(
+        url="redis://localhost:6379",
+        key_prefix="agora:test:dlq",
+        redis_cluster=True,
+    )
+    record = _make_record()
+
+    await sink.open()
+    await sink.write(record)
+
+    record_key = cast("str", record._storage_id)
+    tagged_prefix = "agora:test:dlq:{agora:test:dlq}"
+    assert record_key.startswith(f"{tagged_prefix}:orders:run-1:sink_write:")
+    assert client.lists[f"{tagged_prefix}:__index__"] == [record_key]
+    assert client.upsert_script.calls
+
+    await source.open()
+    records = [item async for item in source.stream()]
+    assert [item.record for item in records] == [{"id": 1}]
+
+    await sink.acknowledge(record)
+    assert client.acknowledge_script.calls
+    assert client.lists[f"{tagged_prefix}:__index__"] == []
+
+
+@pytest.mark.asyncio
+async def test_redis_dlq_cluster_source_and_acknowledge_fallback_to_legacy_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeAsyncRedis()
+    _install_fake_async_redis(monkeypatch, client)
+    sink = RedisDLQSink(
+        url="redis://localhost:6379",
+        key_prefix="agora:test:dlq",
+        redis_cluster=True,
+    )
+    source = RedisDLQSource(
+        url="redis://localhost:6379",
+        key_prefix="agora:test:dlq",
+        pipeline_id="orders",
+        stage="sink_write",
+        redis_cluster=True,
+    )
+    record = _make_record()
+    record_key = "agora:test:dlq:legacy-record"
+    payload = {
+        "pipeline_id": record.pipeline_id,
+        "run_id": record.run_id,
+        "stage": record.stage,
+        "error_type": record.error_type,
+        "error_message": record.error_message,
+        "record": '{"id": 1}',
+        "original_record": "null",
+        "processed_record": "null",
+        "source": record.source or "",
+        "checkpoint": '{"offset": 10}',
+        "details": "null",
+        "middleware": "",
+        "sink": record.sink or "",
+        "created_at": record.created_at.isoformat(),
+        "attempt": "0",
+        "max_attempts": "5",
+        "storage_key": record_key,
+    }
+    client.hashes[record_key] = payload
+    client.lists["agora:test:dlq:__index__:pipeline_stage:orders:sink_write"] = [record_key]
+    client.lists["agora:test:dlq:__index__"] = [record_key]
+    client.lists["agora:test:dlq:__index__:pipeline:orders"] = [record_key]
+    client.lists["agora:test:dlq:__index__:stage:sink_write"] = [record_key]
+
+    await source.open()
+    records = [item async for item in source.stream()]
+    assert [item.record for item in records] == [{"id": 1}]
+
+    await sink.open()
+    await sink.acknowledge(records[0])
+    assert record_key not in client.hashes
+    assert client.lists["agora:test:dlq:__index__"] == []
+    assert client.lists["agora:test:dlq:__index__:pipeline:orders"] == []
+    assert client.lists["agora:test:dlq:__index__:stage:sink_write"] == []
+    assert client.lists["agora:test:dlq:__index__:pipeline_stage:orders:sink_write"] == []
 
 
 def test_redis_dlq_acceptance_and_prometheus_surface(monkeypatch: pytest.MonkeyPatch) -> None:

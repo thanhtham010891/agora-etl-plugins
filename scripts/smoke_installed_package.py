@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
+import tomllib
 from importlib import import_module, metadata
 from pathlib import Path
 
-EXPECTED_VERSION = "0.4.0"
-EXPECTED_CORE_VERSION = "0.4.1"
 EXPECTED_EXTRAS = {"all", "anthropic", "cron", "distributed", "kafka", "postgres", "redis"}
 EXPECTED_ENTRY_POINTS = {
     "agora.sources": {
@@ -63,12 +62,26 @@ EXPECTED_PUBLIC_IMPORTS = {
 }
 
 
+def _repo_metadata() -> tuple[str, str]:
+    pyproject = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
+    project = pyproject["project"]
+    version = str(project["version"])
+    core_requirement = next(
+        dependency
+        for dependency in project["dependencies"]
+        if isinstance(dependency, str) and dependency.startswith("agora-etl>=")
+    )
+    core_floor = core_requirement.split(">=", 1)[1].split(",", 1)[0]
+    return version, core_floor
+
+
 def main() -> None:
     source_package_dir = Path(__file__).resolve().parents[1] / "src" / "agora_plugins"
+    expected_version, expected_core_version = _repo_metadata()
     core_dist = metadata.distribution("agora-etl")
     core_version = core_dist.version
-    if core_version != EXPECTED_CORE_VERSION:
-        raise SystemExit(f"Expected agora-etl {EXPECTED_CORE_VERSION}, got {core_version}.")
+    if core_version != expected_core_version:
+        raise SystemExit(f"Expected agora-etl {expected_core_version}, got {core_version}.")
 
     unexpected_core_entry_points = sorted(
         f"{entry_point.group}:{entry_point.name}"
@@ -84,8 +97,8 @@ def main() -> None:
 
     dist = metadata.distribution("agora-etl-plugins")
     version = dist.version
-    if version != EXPECTED_VERSION:
-        raise SystemExit(f"Expected agora-etl-plugins {EXPECTED_VERSION}, got {version}.")
+    if version != expected_version:
+        raise SystemExit(f"Expected agora-etl-plugins {expected_version}, got {version}.")
 
     extras = set(dist.metadata.get_all("Provides-Extra") or [])
     missing_extras = EXPECTED_EXTRAS - extras

@@ -928,6 +928,7 @@ async def test_kafka_transform_postgres_wedge_routes_schema_evolution_failures_t
             registry_client=registry_client,
             subject=subject,
             schema=schema_v2,
+            auto_register="always",
         )
         good_payload_serializer = _SchemaRegistryPayloadSerializer(good_serializer)
         bad_payload_serializer = _SchemaRegistryPayloadSerializer(bad_serializer)
@@ -2951,6 +2952,7 @@ async def test_kafka_secure_schema_registry_wedge_handoff_survives_rebalance_bro
                 registry_client=registry_client,
                 subject=subject,
                 schema=schema_v2,
+                auto_register="always",
             ),
         }
     )
@@ -3225,6 +3227,7 @@ async def test_kafka_secure_schema_registry_wedge_survives_multi_cycle_rebalance
                 registry_client=kafka_secure_schema_registry_config.schema_registry_client(),
                 subject=subject,
                 schema=schema_v2,
+                auto_register="always",
             ),
         }
     )

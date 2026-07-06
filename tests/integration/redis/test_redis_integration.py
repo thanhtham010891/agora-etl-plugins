@@ -1379,7 +1379,7 @@ async def test_redis_stream_source_log_and_continue_reclaim_clears_pending_poiso
 
 
 @pytest.mark.asyncio
-async def test_redis_stream_source_log_and_continue_without_ack_keeps_poison_pending_and_reclaims_it_repeatedly(
+async def test_redis_stream_source_log_and_continue_acknowledges_reclaimed_poison_once(
     redis_url: str,
     unique_suffix: str,
     redis_service_control,
@@ -1430,7 +1430,7 @@ async def test_redis_stream_source_log_and_continue_without_ack_keeps_poison_pen
         next_record_task = asyncio.create_task(anext(loop_stream))
         try:
             await _wait_for_condition(
-                lambda: loop_source.metrics_snapshot().reclaimed_message_count >= 2,
+                lambda: loop_source.metrics_snapshot().acked_message_count >= 1,
                 timeout_s=5.0,
             )
             with pytest.raises(asyncio.TimeoutError):
@@ -1452,24 +1452,23 @@ async def test_redis_stream_source_log_and_continue_without_ack_keeps_poison_pen
             producer.delete(*keys)
         producer.close()
 
-    assert metrics.reclaimed_message_count >= 2
-    assert metrics.record_error_count >= 2
-    assert metrics.record_drop_count >= 2
-    assert metrics.acked_message_count == 0
-    assert metrics.poison_loop_risk.detected is True
-    assert metrics.poison_loop_risk.loop_count >= 2
-    assert metrics.poison_loop_risk.distinct_message_count == 1
-    assert metrics.poison_loop_risk.last_message_id is not None
-    assert report.passed is False
-    assert any(finding.metric == "poison_loop_count" for finding in report.findings)
-    assert pending_count == 1
+    assert metrics.reclaimed_message_count >= 1
+    assert metrics.record_error_count >= 1
+    assert metrics.record_drop_count >= 1
+    assert metrics.acked_message_count == 1
+    assert metrics.poison_loop_risk.detected is False
+    assert metrics.poison_loop_risk.loop_count == 0
+    assert metrics.poison_loop_risk.distinct_message_count == 0
+    assert metrics.poison_loop_risk.last_message_id is None
+    assert not any(finding.metric == "poison_loop_count" for finding in report.findings)
+    assert pending_count == 0
     assert (
         "agora_test_redis_source_state"
         '{stream="'
         + stream
         + '",group="'
         + group
-        + '",consumer="consumer-b",state="poison_loop_risk"} 1'
+        + '",consumer="consumer-b",state="poison_loop_risk"} 0'
     ) in rendered
     assert (
         "agora_test_redis_source_events_total"
@@ -1482,6 +1481,9 @@ async def test_redis_stream_source_log_and_continue_without_ack_keeps_poison_pen
     ) in rendered
     assert (
         "agora_test_redis_source_events_total"
-        '{stream="' + stream + '",group="' + group + '",consumer="consumer-b",event="poison_loop"} '
-        f"{metrics.poison_loop_risk.loop_count}"
+        '{stream="'
+        + stream
+        + '",group="'
+        + group
+        + '",consumer="consumer-b",event="poison_loop"} 0'
     ) in rendered

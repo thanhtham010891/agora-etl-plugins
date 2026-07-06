@@ -78,7 +78,17 @@ class _FailAfterFirstBatchCursor(_FakeCursor):
 class _FakeConnection:
     def __init__(self, cursor: _FakeCursor) -> None:
         self._cursor = cursor
+        self._cursor_calls = 0
+        self._stream_cursor_assigned = False
+        self._stream_cursor_call_index = 2
+        probe_rows = list(cursor._fetchone_rows)
+        cursor._fetchone_rows = []
+        self._probe_fetchone_rows = probe_rows
+        self._last_probe_row = (
+            probe_rows[-1] if probe_rows else {"is_standby": False, "replay_lag_s": 0.0}
+        )
         self.cursor_invocations: list[dict[str, object]] = []
+        self.opened_cursors: list[_FakeCursor] = []
         self.closed = False
 
     async def __aenter__(self) -> _FakeConnection:
@@ -89,7 +99,18 @@ class _FakeConnection:
 
     def cursor(self, **kwargs: object) -> _FakeCursor:
         self.cursor_invocations.append(dict(kwargs))
-        return self._cursor
+        cursor_call = self._cursor_calls
+        self._cursor_calls += 1
+        if not self._stream_cursor_assigned and cursor_call == self._stream_cursor_call_index:
+            self._stream_cursor_assigned = True
+            self.opened_cursors.append(self._cursor)
+            return self._cursor
+        probe_row = (
+            self._probe_fetchone_rows.pop(0) if self._probe_fetchone_rows else self._last_probe_row
+        )
+        aux_cursor = _FakeCursor([], fetchone_rows=[probe_row])
+        self.opened_cursors.append(aux_cursor)
+        return aux_cursor
 
     async def close(self) -> None:
         self.closed = True
@@ -419,7 +440,7 @@ async def test_postgres_source_row_mapper_can_receive_row_context(
                 "params": {"tenant": "demo"},
                 "read_routing": "dsn",
                 "connected_server_role": "primary",
-                "replica_replay_lag_s": None,
+                "replica_replay_lag_s": 0.0,
             },
         },
         {
@@ -431,7 +452,7 @@ async def test_postgres_source_row_mapper_can_receive_row_context(
                 "params": {"tenant": "demo"},
                 "read_routing": "dsn",
                 "connected_server_role": "primary",
-                "replica_replay_lag_s": None,
+                "replica_replay_lag_s": 0.0,
             },
         },
     ]
@@ -653,13 +674,13 @@ async def test_postgres_source_applies_read_safety_controls_before_query(
     records = [record async for record in source.stream()]
 
     assert records == [1]
-    assert connection.cursor_invocations == [{}, {}, {}]
-    assert "pg_is_in_recovery()" in str(cursor.calls[0][0])
-    assert cursor.calls[1:3] == [
+    assert connection.cursor_invocations[:3] == [{}, {}, {}]
+    assert "pg_is_in_recovery()" in str(connection.opened_cursors[0].calls[0][0])
+    assert connection.opened_cursors[1].calls == [
         ("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY", None),
         ("SELECT set_config('statement_timeout', %s, false)", ("5000",)),
     ]
-    assert cursor.calls[3] == ("SELECT id FROM events ORDER BY id", None)
+    assert cursor.calls == [("SELECT id FROM events ORDER BY id", None)]
 
 
 @pytest.mark.asyncio
@@ -692,7 +713,7 @@ async def test_postgres_source_uses_server_side_cursor_fetch_strategy(
     records = [record async for record in source.stream()]
 
     assert records == [1, 2]
-    assert connection.cursor_invocations == [{}, {}, {"name": "agora_cursor", "withhold": True}]
+    assert connection.cursor_invocations[:3] == [{}, {}, {"name": "agora_cursor", "withhold": True}]
 
 
 @pytest.mark.asyncio
@@ -918,6 +939,65 @@ async def test_postgres_source_falls_back_to_primary_when_preferred_standby_is_s
 
 
 @pytest.mark.asyncio
+async def test_postgres_source_route_primary_rejects_non_primary_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    standby_cursor = _FakeCursor([])
+    fallback_cursor = _FakeCursor([])
+    standby_connection = _FakeConnection(standby_cursor)
+    fallback_connection = _FakeConnection(fallback_cursor)
+    connect_calls: list[dict[str, object]] = []
+
+    class _AsyncConnection:
+        @staticmethod
+        async def connect(*args, **kwargs):
+            del args
+            connect_calls.append(dict(kwargs))
+            if kwargs.get("target_session_attrs") == "primary":
+                return fallback_connection
+            return standby_connection
+
+    fake_psycopg = SimpleNamespace(AsyncConnection=_AsyncConnection)
+    fake_rows = SimpleNamespace(dict_row=object())
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+    monkeypatch.setitem(sys.modules, "psycopg.rows", fake_rows)
+
+    source = PostgresSource(
+        dsn="postgresql://example/test",
+        query="SELECT id FROM events ORDER BY id",
+        row_mapper=lambda row: row["id"],
+        read_routing="prefer_standby",
+        max_replica_replay_lag_s=3.0,
+        on_replica_stale="route_primary",
+    )
+
+    async def _inspect_server_role(conn: object) -> tuple[str, float | None]:
+        if conn is standby_connection:
+            return "standby", 9.5
+        return "standby", 0.0
+
+    monkeypatch.setattr(source, "_inspect_server_role", _inspect_server_role)
+
+    with pytest.raises(RuntimeError, match="must connect to a primary server"):
+        [record async for record in source.stream()]
+
+    snapshot = source.metrics_snapshot()
+
+    assert [call["target_session_attrs"] for call in connect_calls] == [
+        "prefer-standby",
+        "primary",
+    ]
+    assert standby_connection.closed is True
+    assert fallback_connection.closed is True
+    assert snapshot.connected_server_role == "standby"
+    assert snapshot.last_replica_replay_lag_s == 0.0
+    assert snapshot.last_health_error is not None
+    assert "did not resolve to a primary" in snapshot.last_health_error
+    assert snapshot.staleness_guard_block_count == 1
+    assert snapshot.staleness_guard_primary_fallback_count == 0
+
+
+@pytest.mark.asyncio
 async def test_postgres_source_health_snapshot_reports_unready_when_standby_is_stale(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1002,6 +1082,64 @@ async def test_postgres_source_fail_closes_when_standby_is_stale(
     assert connection.closed is True
     assert snapshot.connected_server_role == "standby"
     assert snapshot.last_replica_replay_lag_s == 12.0
+    assert snapshot.staleness_guard_block_count == 1
+    assert snapshot.staleness_guard_primary_fallback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_postgres_source_blocks_when_active_standby_turns_stale_mid_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cursor = _FakeCursor([{"id": 1}, {"id": 2}], batch_size=1)
+    connection = _FakeConnection(cursor)
+    connection._stream_cursor_call_index = 1
+
+    class _AsyncConnection:
+        @staticmethod
+        async def connect(*args, **kwargs):
+            del args, kwargs
+            return connection
+
+    fake_psycopg = SimpleNamespace(AsyncConnection=_AsyncConnection)
+    fake_rows = SimpleNamespace(dict_row=object())
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+    monkeypatch.setitem(sys.modules, "psycopg.rows", fake_rows)
+
+    source = PostgresSource(
+        dsn="postgresql://example/test",
+        query="SELECT id FROM events ORDER BY id",
+        row_mapper=lambda row: row["id"],
+        batch_size=1,
+        read_routing="standby",
+        max_replica_replay_lag_s=2.0,
+    )
+
+    role_checks = [
+        ("standby", 0.5),
+        ("standby", 0.5),
+        ("standby", 9.0),
+    ]
+
+    async def _inspect_server_role(conn: object) -> tuple[str, float | None]:
+        del conn
+        return role_checks.pop(0)
+
+    monkeypatch.setattr(source, "_inspect_server_role", _inspect_server_role)
+
+    stream = source.stream()
+
+    assert await anext(stream) == 1
+    with pytest.raises(PostgresReplicaStalenessError, match="replay lag exceeded"):
+        await anext(stream)
+
+    snapshot = source.metrics_snapshot()
+
+    assert connection.closed is False
+    assert source.current_checkpoint() == {"row_number": 1}
+    assert snapshot.connected_server_role == "standby"
+    assert snapshot.last_replica_replay_lag_s == 9.0
+    assert snapshot.last_health_error is not None
+    assert "replay lag exceeded" in snapshot.last_health_error
     assert snapshot.staleness_guard_block_count == 1
     assert snapshot.staleness_guard_primary_fallback_count == 0
 

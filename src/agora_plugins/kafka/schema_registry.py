@@ -10,7 +10,9 @@ import io
 import json
 import re
 import struct
+import textwrap
 import warnings
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeVar, cast
 from urllib import error, parse, request
@@ -20,12 +22,15 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
 T = TypeVar("T")
+K = TypeVar("K")
+V = TypeVar("V")
 SchemaAutoRegisterMode = Literal["disabled", "missing_subject", "always"]
 
 _CONFLUENT_MAGIC_BYTE = 0
 _SCHEMA_AUTO_REGISTER_MODES: set[str] = {"disabled", "missing_subject", "always"}
 _PROTO_IDENTIFIER_RE = re.compile(r"[A-Za-z_][\w.]*")
 _PROTO_BLOCK_KEYWORDS = {"message", "enum", "oneof", "service", "extend", "group"}
+_DEFAULT_SCHEMA_CACHE_MAX_ENTRIES = 256
 
 
 @dataclass(slots=True)
@@ -366,10 +371,11 @@ async def _resolve_registered_schema(
     auto_register: SchemaAutoRegisterMode,
     normalize_schema: Callable[[str], str],
 ) -> RegisteredSchema:
+    normalized_schema_text = normalize_schema(schema_text)
     if auto_register == "always":
         return await registry_client.register_schema(
             subject,
-            schema_text,
+            normalized_schema_text,
             schema_type=schema_type,
         )
 
@@ -379,12 +385,12 @@ async def _resolve_registered_schema(
         if auto_register == "missing_subject" and _schema_registry_subject_is_missing(exc):
             return await registry_client.register_schema(
                 subject,
-                schema_text,
+                normalized_schema_text,
                 schema_type=schema_type,
             )
         raise
 
-    if normalize_schema(registered.schema) != schema_text:
+    if normalize_schema(registered.schema) != normalized_schema_text:
         raise ValueError(f"Latest schema for subject '{subject}' does not match serializer schema.")
     return registered
 
@@ -407,6 +413,33 @@ def _schema_registry_subject_is_missing(exc: Exception) -> bool:
     )
 
 
+def _coerce_schema_cache_max_entries(schema_cache_max_entries: int) -> int:
+    if schema_cache_max_entries < 1:
+        raise ValueError("schema_cache_max_entries must be >= 1.")
+    return schema_cache_max_entries
+
+
+def _lru_cache_get(cache: OrderedDict[K, V], key: K) -> V | None:
+    value = cache.get(key)
+    if value is None:
+        return None
+    cache.move_to_end(key)
+    return value
+
+
+def _lru_cache_put(
+    cache: OrderedDict[K, V],
+    key: K,
+    value: V,
+    *,
+    max_entries: int,
+) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > max_entries:
+        cache.popitem(last=False)
+
+
 class AvroSchemaRegistrySerializer(Generic[T]):
     """Encode records using Confluent wire format and registry-managed Avro schemas."""
 
@@ -417,7 +450,7 @@ class AvroSchemaRegistrySerializer(Generic[T]):
         subject: str,
         schema: dict[str, Any] | list[Any] | str,
         record_mapper: Callable[[T], dict[str, Any]] | None = None,
-        auto_register: bool | SchemaAutoRegisterMode = "always",
+        auto_register: bool | SchemaAutoRegisterMode = "missing_subject",
     ) -> None:
         self._registry_client = registry_client
         self._subject = subject
@@ -465,6 +498,7 @@ class AvroSchemaRegistryDeserializer(Generic[T]):
         registry_client: SchemaRegistryClient,
         record_mapper: Callable[[dict[str, Any]], T] | None = None,
         reader_schema: dict[str, Any] | list[Any] | str | None = None,
+        schema_cache_max_entries: int = _DEFAULT_SCHEMA_CACHE_MAX_ENTRIES,
     ) -> None:
         self._registry_client = registry_client
         self._record_mapper = record_mapper
@@ -472,7 +506,8 @@ class AvroSchemaRegistryDeserializer(Generic[T]):
             _normalize_avro_schema_text(reader_schema) if reader_schema else None
         )
         self._reader_schema: Any = None
-        self._writer_schemas: dict[int, Any] = {}
+        self._schema_cache_max_entries = _coerce_schema_cache_max_entries(schema_cache_max_entries)
+        self._writer_schemas: OrderedDict[int, Any] = OrderedDict()
 
     async def open(self) -> None:
         if self._reader_schema_text is None:
@@ -493,11 +528,16 @@ class AvroSchemaRegistryDeserializer(Generic[T]):
             raise ValueError("Unsupported schema-registry payload magic byte.")
 
         schema_id, payload_offset, _ = _decode_confluent_prefix(value)
-        writer_schema = self._writer_schemas.get(schema_id)
+        writer_schema = _lru_cache_get(self._writer_schemas, schema_id)
         if writer_schema is None:
             registered = await self._registry_client.get_schema(schema_id)
             writer_schema = parse_schema(json.loads(_normalize_avro_schema_text(registered.schema)))
-            self._writer_schemas[schema_id] = writer_schema
+            _lru_cache_put(
+                self._writer_schemas,
+                schema_id,
+                writer_schema,
+                max_entries=self._schema_cache_max_entries,
+            )
 
         record = schemaless_reader(
             io.BytesIO(value[payload_offset:]),
@@ -523,7 +563,7 @@ class JsonSchemaRegistrySerializer(Generic[T]):
         subject: str,
         schema: dict[str, Any] | list[Any] | str,
         record_mapper: Callable[[T], Any] | None = None,
-        auto_register: bool | SchemaAutoRegisterMode = "always",
+        auto_register: bool | SchemaAutoRegisterMode = "missing_subject",
         validate_payload: bool = True,
     ) -> None:
         self._registry_client = registry_client
@@ -570,12 +610,14 @@ class JsonSchemaRegistryDeserializer(Generic[T]):
         record_mapper: Callable[[Any], T] | None = None,
         reader_schema: dict[str, Any] | list[Any] | str | None = None,
         validate_payload: bool = True,
+        schema_cache_max_entries: int = _DEFAULT_SCHEMA_CACHE_MAX_ENTRIES,
     ) -> None:
         self._registry_client = registry_client
         self._record_mapper = record_mapper
         self._reader_schema_text = _normalize_schema_text(reader_schema) if reader_schema else None
         self._reader_schema: Any = None
-        self._writer_schemas: dict[int, Any] = {}
+        self._schema_cache_max_entries = _coerce_schema_cache_max_entries(schema_cache_max_entries)
+        self._writer_schemas: OrderedDict[int, Any] = OrderedDict()
         self._validate_payload = validate_payload
 
     async def open(self) -> None:
@@ -588,11 +630,16 @@ class JsonSchemaRegistryDeserializer(Generic[T]):
 
     async def __call__(self, value: bytes) -> T:
         schema_id, payload_offset, _ = _decode_confluent_prefix(value)
-        writer_schema = self._writer_schemas.get(schema_id)
+        writer_schema = _lru_cache_get(self._writer_schemas, schema_id)
         if writer_schema is None:
             registered = await self._registry_client.get_schema(schema_id)
             writer_schema = json.loads(_normalize_schema_text(registered.schema))
-            self._writer_schemas[schema_id] = writer_schema
+            _lru_cache_put(
+                self._writer_schemas,
+                schema_id,
+                writer_schema,
+                max_entries=self._schema_cache_max_entries,
+            )
         payload = json.loads(value[payload_offset:].decode("utf-8"))
         if self._validate_payload:
             _jsonschema_validate(payload, self._reader_schema or writer_schema)
@@ -612,7 +659,7 @@ class ProtobufSchemaRegistrySerializer(Generic[T]):
         schema: str,
         message_type: type[Any],
         record_mapper: Callable[[T], Any] | None = None,
-        auto_register: bool | SchemaAutoRegisterMode = "always",
+        auto_register: bool | SchemaAutoRegisterMode = "missing_subject",
         message_indexes: Sequence[int] = (0,),
     ) -> None:
         self._registry_client = registry_client
@@ -675,12 +722,14 @@ class ProtobufSchemaRegistryDeserializer(Generic[T]):
         registry_client: SchemaRegistryClient,
         message_type: type[Any],
         record_mapper: Callable[[Any], T] | None = None,
+        schema_cache_max_entries: int = _DEFAULT_SCHEMA_CACHE_MAX_ENTRIES,
     ) -> None:
         self._registry_client = registry_client
         self._message_type = message_type
         self._record_mapper = record_mapper
-        self._registered_schemas: dict[int, RegisteredSchema] = {}
-        self._validated_bindings: set[tuple[int, tuple[int, ...]]] = set()
+        self._schema_cache_max_entries = _coerce_schema_cache_max_entries(schema_cache_max_entries)
+        self._registered_schemas: OrderedDict[int, RegisteredSchema] = OrderedDict()
+        self._validated_bindings: OrderedDict[tuple[int, tuple[int, ...]], None] = OrderedDict()
 
     async def open(self) -> None:
         return None
@@ -694,21 +743,31 @@ class ProtobufSchemaRegistryDeserializer(Generic[T]):
             expect_message_indexes=True,
         )
         binding_key = (schema_id, message_indexes or (0,))
-        registered = self._registered_schemas.get(schema_id)
+        registered = _lru_cache_get(self._registered_schemas, schema_id)
         if registered is None:
             registered = await self._registry_client.get_schema(schema_id)
-            self._registered_schemas[schema_id] = registered
+            _lru_cache_put(
+                self._registered_schemas,
+                schema_id,
+                registered,
+                max_entries=self._schema_cache_max_entries,
+            )
         if registered.schema_type != "PROTOBUF":
             raise ValueError(
                 f"Schema id {schema_id} is registered as {registered.schema_type!r}, not 'PROTOBUF'."
             )
-        if binding_key not in self._validated_bindings:
+        if _lru_cache_get(self._validated_bindings, binding_key) is None:
             _validate_protobuf_schema_binding(
                 registered.schema,
                 self._message_type,
                 binding_key[1],
             )
-            self._validated_bindings.add(binding_key)
+            _lru_cache_put(
+                self._validated_bindings,
+                binding_key,
+                None,
+                max_entries=self._schema_cache_max_entries,
+            )
         message = self._message_type()
         message.ParseFromString(value[payload_offset:])
         if self._record_mapper is None:
@@ -735,7 +794,8 @@ def _normalize_avro_schema_text(schema: dict[str, Any] | list[Any] | str) -> str
 
 
 def _normalize_proto_schema_text(schema: str) -> str:
-    return "\n".join(line.rstrip() for line in schema.strip().splitlines())
+    normalized = textwrap.dedent(schema).strip()
+    return "\n".join(line.strip() for line in normalized.splitlines() if line.strip())
 
 
 def _encode_confluent_prefix(

@@ -28,6 +28,7 @@ _INTEGRATION_TIMEOUT_S = 30.0
 _REPLICA_STALE_LAG_S = 0.1
 _REPLICA_LAG_TIMEOUT_S = 10.0
 _POSTGRES_HA_STEP_TIMEOUT_S = 45.0
+_POSTGRES_HA_FAILOVER_CYCLE_STEP_TIMEOUT_S = 150.0
 
 
 class _ReverseCipher:
@@ -2037,7 +2038,12 @@ async def test_postgres_source_prefer_standby_falls_back_to_primary_across_multi
             )
 
             if phase_index < postgres_ha_soak_cycles:
-                transitions.append(await _run_postgres_ha_step(postgres_ha_control.failover_cycle))
+                transitions.append(
+                    await _run_postgres_ha_step(
+                        postgres_ha_control.failover_cycle,
+                        step_timeout_s=_POSTGRES_HA_FAILOVER_CYCLE_STEP_TIMEOUT_S,
+                    )
+                )
     finally:
         await conn.close()
         conn = await psycopg.AsyncConnection.connect(postgres_ha_dsn, autocommit=True)

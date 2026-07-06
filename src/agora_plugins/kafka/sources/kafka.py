@@ -666,6 +666,9 @@ class KafkaSource(BaseSource[T], Generic[T]):
                             mark_acknowledged=mark_acknowledged,
                         )
                     )
+                    # Checkpoint resume tracks the last emitted source offset.
+                    # Broker commits remain gated on handled delivery and resume
+                    # seeks from checkpoint offset + 1 on the next open.
                     self._remember_processed_offset(msg.topic, msg.partition, msg.offset)
                     self._delivery_context = self._delivery_context_from_metadata(
                         batch_contexts[index].metadata

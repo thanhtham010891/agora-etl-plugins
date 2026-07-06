@@ -102,7 +102,7 @@ async def test_complete_returns_completion_response(monkeypatch: pytest.MonkeyPa
     )
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
 
-    provider = AnthropicProvider(model="claude-3-5-haiku-20241022")
+    provider = AnthropicProvider(model="claude-haiku-4-5-20251001")
     response = await provider.complete(
         "Summarize this review",
         system="Return concise JSON.",
@@ -112,12 +112,12 @@ async def test_complete_returns_completion_response(monkeypatch: pytest.MonkeyPa
     assert api_keys == ["test-key"]
     assert isinstance(response, CompletionResponse)
     assert response.content == '{"summary": "Great broth", "sentiment": "positive"}'
-    assert response.model == "claude-3-5-haiku-20241022"
+    assert response.model == "claude-haiku-4-5-20251001"
     assert response.input_tokens == 12
     assert response.output_tokens == 7
     assert calls == [
         {
-            "model": "claude-3-5-haiku-20241022",
+            "model": "claude-haiku-4-5-20251001",
             "max_tokens": 256,
             "temperature": 0.0,
             "messages": [{"role": "user", "content": "Summarize this review"}],
@@ -137,7 +137,7 @@ async def test_complete_counts_cached_input_tokens(monkeypatch: pytest.MonkeyPat
     )
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
 
-    provider = AnthropicProvider(model="claude-3-5-haiku-20241022")
+    provider = AnthropicProvider(model="claude-haiku-4-5-20251001")
     response = await provider.complete("Summarize this review")
 
     assert response.input_tokens == 17
@@ -158,6 +158,7 @@ async def test_complete_with_response_format_adds_schema_instruction(
         "Label this cafe review",
         system="Return JSON only.",
         response_format=_StructuredReview,
+        use_tool_for_response_format=False,
     )
 
     assert response.content == '{"summary": "Good coffee", "sentiment": "positive"}'
@@ -182,6 +183,7 @@ async def test_complete_with_response_format_returns_repaired_json_content(
     response = await provider.complete(
         "Label this cafe review",
         response_format=_StructuredReview,
+        use_tool_for_response_format=False,
         repair_invalid_json=True,
     )
 
@@ -202,6 +204,7 @@ async def test_complete_raises_clear_error_for_invalid_structured_output(
         await provider.complete(
             "Label this cafe review",
             response_format=_StructuredReview,
+            use_tool_for_response_format=False,
         )
 
 
@@ -422,7 +425,9 @@ async def test_complete_can_use_prompt_cache_blocks(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
-async def test_complete_can_force_structured_tool_use(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_complete_uses_structured_tool_use_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: list[dict[str, object]] = []
 
     class _FakeMessages:
@@ -454,7 +459,6 @@ async def test_complete_can_force_structured_tool_use(monkeypatch: pytest.Monkey
     response = await provider.complete(
         "Label this review",
         response_format=_StructuredReview,
-        use_tool_for_response_format=True,
     )
 
     assert response.content == '{"summary":"Solid noodles","sentiment":"positive"}'
@@ -473,7 +477,11 @@ async def test_complete_repairs_wrapped_json_for_structured_output(
     monkeypatch.setenv("ANTHROPIC_API_KEY", "repair-key")
 
     provider = AnthropicProvider()
-    response = await provider.complete("Label", response_format=_StructuredReview)
+    response = await provider.complete(
+        "Label",
+        response_format=_StructuredReview,
+        use_tool_for_response_format=False,
+    )
 
     assert '"summary": "ok"' in response.content
 
@@ -791,6 +799,77 @@ async def test_complete_batch_message_batches_api_polls_and_returns_results_in_p
 
 
 @pytest.mark.asyncio
+async def test_complete_batch_message_batches_api_uses_structured_tool_use_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class _FakeBatches:
+        async def create(self, **kwargs: object) -> object:
+            calls.append(("create", kwargs))
+            return SimpleNamespace(id="batch-structured", processing_status="in_progress")
+
+        async def retrieve(self, batch_id: str) -> object:
+            calls.append(("retrieve", batch_id))
+            return SimpleNamespace(id=batch_id, processing_status="ended")
+
+        async def results(self, batch_id: str) -> list[object]:
+            calls.append(("results", batch_id))
+            return [
+                SimpleNamespace(
+                    custom_id="agora-0",
+                    result=SimpleNamespace(
+                        type="succeeded",
+                        message=SimpleNamespace(
+                            content=[
+                                SimpleNamespace(
+                                    type="tool_use",
+                                    input={"summary": "first", "sentiment": "positive"},
+                                )
+                            ],
+                            usage=SimpleNamespace(input_tokens=1, output_tokens=2),
+                        ),
+                    ),
+                )
+            ]
+
+    class _FakeMessages:
+        def __init__(self) -> None:
+            self.batches = _FakeBatches()
+
+    class _FakeAsyncAnthropic:
+        def __init__(self, *, api_key: str, max_retries: int = 0) -> None:
+            del api_key, max_retries
+            self.messages = _FakeMessages()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=_FakeAsyncAnthropic),
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "batch-structured-key")
+
+    provider = AnthropicProvider()
+    responses = await provider.complete_batch(
+        ["a"],
+        response_format=_StructuredReview,
+        use_message_batches_api=True,
+        message_batch_poll_interval_s=0,
+        message_batch_timeout_s=1,
+    )
+
+    assert [response.content for response in responses] == [
+        '{"summary":"first","sentiment":"positive"}'
+    ]
+    create_payload = calls[0][1]
+    assert isinstance(create_payload, dict)
+    assert create_payload["requests"][0]["params"]["tool_choice"] == {
+        "type": "tool",
+        "name": "agora__structuredreview_response",
+    }
+
+
+@pytest.mark.asyncio
 async def test_complete_batch_message_batches_api_raises_for_failed_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -893,6 +972,26 @@ def test_provider_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(ValueError, match="Anthropic API key is required"):
         AnthropicProvider()
+
+
+def test_provider_rejects_unknown_model_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_anthropic(monkeypatch, response_text="ok")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "model-key")
+
+    with pytest.raises(ValueError, match="supported production model ids"):
+        AnthropicProvider(model="claude-9-9-phantom-20990101")
+
+
+def test_provider_can_opt_into_unknown_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_anthropic(monkeypatch, response_text="ok")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "model-key")
+
+    provider = AnthropicProvider(
+        model="claude-9-9-phantom-20990101",
+        allow_unknown_models=True,
+    )
+
+    assert provider.model == "claude-9-9-phantom-20990101"
 
 
 @pytest.mark.asyncio
