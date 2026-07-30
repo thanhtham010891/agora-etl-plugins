@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 from agora import DeliveryConfig, Pipeline, SourceRecordFailurePolicy
 from agora.core.acceptance import AcceptanceFinding, AcceptanceReport
-from agora.core.checkpoint import Checkpoint
+from agora.core.checkpoint import Checkpoint, SourceIdentityMismatchError
 from agora.core.health import ComponentHealthSnapshot
 from agora.core.retry import RetryPolicy
 from agora.core.source import SourceRecordError
@@ -262,6 +262,28 @@ async def test_redis_stream_source_fails_closed_on_bad_messages_by_default() -> 
 
 
 @pytest.mark.asyncio
+async def test_redis_stream_source_exposes_active_delivery_identity() -> None:
+    source = RedisStreamSource(
+        url="redis://localhost:6379",
+        stream="events",
+        group="g",
+        consumer="c",
+    )
+    source._client = _FakeRedisClient([("events", [("1-0", {"value": "1"})])])  # type: ignore[attr-defined]
+
+    with pytest.raises(asyncio.CancelledError):
+        async for _record in source.stream():
+            context = source.delivery_context()
+            assert context is not None
+            assert context.delivery_id == "events:1-0"
+            assert context.to_dict()["group"] == "g"
+            await _ack_delivery(source)
+
+    assert source.delivery_context() is None
+    assert source.delivery_success_callback() is None
+
+
+@pytest.mark.asyncio
 async def test_redis_stream_source_can_log_and_continue_on_bad_messages() -> None:
     source = RedisStreamSource(
         url="redis://localhost:6379",
@@ -406,6 +428,7 @@ async def test_redis_stream_source_resume_replays_pending_then_tails_new_message
             run_id="run",
             source="redis_stream",
             value={"message_id": "2-0"},
+            source_identity=source.checkpoint_source_identity(),
         )
     )
 
@@ -429,6 +452,50 @@ async def test_redis_stream_source_resume_replays_pending_then_tails_new_message
 
 
 @pytest.mark.asyncio
+async def test_redis_stream_source_rejects_checkpoint_from_different_input() -> None:
+    source = RedisStreamSource(
+        url="redis://localhost:6379",
+        stream="events",
+        group="g",
+        consumer="c",
+    )
+    other_source = RedisStreamSource(
+        url="redis://localhost:6379",
+        stream="orders",
+        group="g",
+        consumer="c",
+    )
+    rotated_credential_source = RedisStreamSource(
+        url="redis://:new-secret@localhost:6379",
+        stream="events",
+        group="g",
+        consumer="c",
+    )
+    prior_credential_source = RedisStreamSource(
+        url="redis://:old-secret@localhost:6379",
+        stream="events",
+        group="g",
+        consumer="c",
+    )
+
+    assert (
+        rotated_credential_source.checkpoint_source_identity()
+        == prior_credential_source.checkpoint_source_identity()
+    )
+
+    with pytest.raises(SourceIdentityMismatchError, match="saved source identity differs"):
+        await source.prepare_resume(
+            Checkpoint(
+                pipeline_id="pipe",
+                run_id="run",
+                source="redis_stream",
+                value={"message_id": "2-0"},
+                source_identity=other_source.checkpoint_source_identity(),
+            )
+        )
+
+
+@pytest.mark.asyncio
 async def test_redis_stream_source_resume_requires_xinfo_consumers_support() -> None:
     source = RedisStreamSource(
         url="redis://localhost:6379",
@@ -447,6 +514,7 @@ async def test_redis_stream_source_resume_requires_xinfo_consumers_support() -> 
             run_id="run",
             source="redis_stream",
             value={"message_id": "2-0"},
+            source_identity=source.checkpoint_source_identity(),
         )
     )
 
@@ -474,6 +542,7 @@ async def test_redis_stream_source_resume_requires_xgroup_setid_support() -> Non
             run_id="run",
             source="redis_stream",
             value={"message_id": "2-0"},
+            source_identity=source.checkpoint_source_identity(),
         )
     )
 
@@ -503,6 +572,7 @@ async def test_redis_stream_source_resume_rejects_multi_consumer_group() -> None
             run_id="run",
             source="redis_stream",
             value={"message_id": "2-0"},
+            source_identity=source.checkpoint_source_identity(),
         )
     )
 
@@ -988,3 +1058,24 @@ def test_redis_stream_source_health_acceptance_and_prometheus_surface() -> None:
         in rendered
     )
     assert "# TYPE agora_test_redis_source_age_ms gauge" not in rendered
+
+
+def test_redis_stream_source_acceptance_rejects_ack_before_delivery() -> None:
+    source = RedisStreamSource(
+        url="redis://localhost:6379",
+        stream="events",
+        group="g",
+        consumer="c",
+        ack_on_success=False,
+    )
+    source._client = object()  # type: ignore[attr-defined]
+    source._group_ready = True  # type: ignore[attr-defined]
+
+    report = source.acceptance_report()
+    relaxed_report = source.acceptance_report(
+        RedisSourceEnterpriseAcceptanceThresholds(require_ack_on_success=False)
+    )
+
+    assert report.passed is False
+    assert {finding.metric for finding in report.findings} == {"ack_on_success"}
+    assert relaxed_report.passed is True

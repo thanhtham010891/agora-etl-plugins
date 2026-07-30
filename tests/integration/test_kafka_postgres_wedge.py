@@ -20,6 +20,7 @@ from agora_plugins.kafka import (
     KafkaTransformSinkRuntime,
 )
 from agora_plugins.postgres import (
+    KafkaPostgresDeliveryConfig,
     KafkaPostgresEnterpriseAcceptanceThresholds,
     KafkaPostgresPoisonDLQConfig,
     KafkaPostgresRuntime,
@@ -1112,6 +1113,7 @@ async def test_kafka_transform_postgres_wedge_resume_and_replay_stay_idempotent(
 
     topic = f"agora-wedge-replay-{unique_suffix}"
     table = f"agora_kafka_pg_replay_{unique_suffix}"
+    consumer_group = f"agora-wedge-resume-{unique_suffix}"
     store = InMemoryCheckpointStore()
     source_records = [
         {
@@ -1162,7 +1164,7 @@ async def test_kafka_transform_postgres_wedge_resume_and_replay_stay_idempotent(
                     KafkaSource(
                         topics=[topic],
                         bootstrap_servers=kafka_bootstrap,
-                        group_id=f"agora-wedge-resume-a-{unique_suffix}",
+                        group_id=consumer_group,
                         deserializer=lambda value, metadata: {
                             "payload": json.loads(value.decode("utf-8")),
                             "metadata": metadata,
@@ -1194,7 +1196,7 @@ async def test_kafka_transform_postgres_wedge_resume_and_replay_stay_idempotent(
                     KafkaSource(
                         topics=[topic],
                         bootstrap_servers=kafka_bootstrap,
-                        group_id=f"agora-wedge-resume-b-{unique_suffix}",
+                        group_id=consumer_group,
                         deserializer=lambda value, metadata: {
                             "payload": json.loads(value.decode("utf-8")),
                             "metadata": metadata,
@@ -1290,11 +1292,15 @@ async def test_kafka_transform_postgres_runtime_delivery_key_keeps_replay_idempo
     source_records = [
         {
             "key": "customer-1",
+            "partition": 0,
+            "sequence": 0,
             "headers": [("tenant", "acme"), ("event_type", "customer.created")],
             "payload": {"id": 1, "name": "alpha"},
         },
         {
             "key": "customer-2",
+            "partition": 0,
+            "sequence": 1,
             "headers": [("tenant", "acme"), ("event_type", "customer.updated")],
             "payload": {"id": 2, "name": "bravo"},
         },
@@ -1343,6 +1349,7 @@ async def test_kafka_transform_postgres_runtime_delivery_key_keeps_replay_idempo
             table=table,
             transform=_customer_transform,
             batch_size=2,
+            delivery=KafkaPostgresDeliveryConfig(metadata_field=None),
         )
         await first_runtime.open()
         try:
@@ -1367,6 +1374,7 @@ async def test_kafka_transform_postgres_runtime_delivery_key_keeps_replay_idempo
             table=table,
             transform=_customer_transform,
             batch_size=2,
+            delivery=KafkaPostgresDeliveryConfig(metadata_field=None),
         )
         await replay_runtime.open()
         try:
@@ -2023,6 +2031,18 @@ async def test_kafka_multi_partition_transform_postgres_resumes_from_mixed_check
         for record in source_records
         if (int(record["partition"]), int(record["sequence"])) in {(0, 0), (0, 1), (1, 0)}
     ]
+    resume_source = KafkaSource(
+        topics=[topic],
+        bootstrap_servers=kafka_bootstrap,
+        group_id=f"agora-wedge-multi-replay-{unique_suffix}",
+        deserializer=lambda value, metadata: {
+            "payload": json.loads(value.decode("utf-8")),
+            "metadata": metadata,
+        },
+        auto_offset_reset="earliest",
+        enable_auto_commit=False,
+        commit_every=1,
+    )
 
     await store.save(
         checkpoint_key,
@@ -2039,6 +2059,7 @@ async def test_kafka_multi_partition_transform_postgres_resumes_from_mixed_check
                     {"topic": topic, "partition": 1, "offset": 0},
                 ],
             },
+            source_identity=resume_source.checkpoint_source_identity(),
         ),
     )
 
@@ -2076,20 +2097,7 @@ async def test_kafka_multi_partition_transform_postgres_resumes_from_mixed_check
 
         summary = await asyncio.wait_for(
             (
-                Pipeline(
-                    KafkaSource(
-                        topics=[topic],
-                        bootstrap_servers=kafka_bootstrap,
-                        group_id=f"agora-wedge-multi-replay-{unique_suffix}",
-                        deserializer=lambda value, metadata: {
-                            "payload": json.loads(value.decode("utf-8")),
-                            "metadata": metadata,
-                        },
-                        auto_offset_reset="earliest",
-                        enable_auto_commit=False,
-                        commit_every=1,
-                    )
-                )
+                Pipeline(resume_source)
                 .pipe(MapMiddleware(_customer_transform, name="kafka_to_postgres_row"))
                 .build(
                     PostgresSink(

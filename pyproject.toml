@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agora-etl-plugins"
-version = "0.4.2"
+version = "0.4.3"
 description = "Official plugins for agora-etl — Redis, Kafka, PostgreSQL, BigQuery, S3, cron scheduling, distributed coordination, and Anthropic AI support."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -24,7 +24,7 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 dependencies = [
-    "agora-etl>=0.4.5,<1",
+    "agora-etl>=0.4.6,<1",
 ]
 
 [project.urls]

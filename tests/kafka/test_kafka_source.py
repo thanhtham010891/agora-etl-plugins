@@ -11,8 +11,13 @@ from agora import (
     Pipeline,
     SourceRecordFailurePolicy,
 )
-from agora.core.checkpoint import Checkpoint, InMemoryCheckpointStore
+from agora.core.checkpoint import (
+    Checkpoint,
+    InMemoryCheckpointStore,
+    SourceIdentityMismatchError,
+)
 from agora.core.failures import PoisonRecordClassification
+from agora.core.retry import RetryPolicy
 from agora.core.source import SourceRecordError
 
 from agora_plugins.kafka import (
@@ -23,6 +28,7 @@ from agora_plugins.kafka import (
     KafkaSecurityConfig,
     KafkaSource,
 )
+from agora_plugins.kafka.failures import classify_kafka_failure
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -255,6 +261,34 @@ class _FakeBatchConsumer:
             topic = partition[0]
             part = partition[1]
         return self.committed_map.get((str(topic), int(part)))
+
+
+class _FlakyBatchConsumer(_FakeBatchConsumer):
+    def __init__(self, batches: list[list[bytes]]) -> None:
+        super().__init__(batches)
+        self.getmany_calls = 0
+
+    async def getmany(
+        self,
+        *,
+        timeout_ms: int,
+        max_records: int,
+    ) -> dict[tuple[str, int], list[_FakeMessage]]:
+        self.getmany_calls += 1
+        if self.getmany_calls == 1:
+            raise ConnectionError("broker connection interrupted")
+        return await super().getmany(timeout_ms=timeout_ms, max_records=max_records)
+
+
+class _UnavailableBatchConsumer(_FakeBatchConsumer):
+    async def getmany(
+        self,
+        *,
+        timeout_ms: int,
+        max_records: int,
+    ) -> dict[tuple[str, int], list[_FakeMessage]]:
+        del timeout_ms, max_records
+        raise RuntimeError("leader not available")
 
 
 @dataclass(frozen=True)
@@ -1029,6 +1063,41 @@ async def test_getmany_batches_messages_when_supported() -> None:
 
 
 @pytest.mark.asyncio
+async def test_getmany_retries_classified_broker_connectivity_failure() -> None:
+    source = KafkaSource(
+        topics=["events"],
+        deserializer=lambda b: b.decode(),
+        enable_auto_commit=False,
+        commit_every=10,
+        poll_timeout_ms=10,
+        max_poll_records=10,
+    )
+    consumer = _FlakyBatchConsumer([[b"a"]])
+    source._consumer = consumer  # type: ignore[attr-defined]
+
+    assert [record async for record in source.stream()] == ["a"]
+    assert consumer.getmany_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_getmany_preserves_kafka_failure_decision_after_retry_exhaustion() -> None:
+    source = KafkaSource(
+        topics=["events"],
+        deserializer=lambda b: b.decode(),
+        consumer_retry_policy=RetryPolicy(
+            max_attempts=1,
+            failure_classifier=classify_kafka_failure,
+        ),
+    )
+    source._consumer = _UnavailableBatchConsumer([])  # type: ignore[attr-defined]
+
+    with pytest.raises(RuntimeError, match="leader not available") as exc_info:
+        _ = [record async for record in source.stream()]
+
+    assert exc_info.value.failure_decision.classification.value == "connectivity"  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_getmany_can_exit_after_configured_idle_polls() -> None:
     source = KafkaSource(
         topics=["events"],
@@ -1321,6 +1390,7 @@ async def test_prepare_resume_seeks_consumer_to_next_offset() -> None:
             run_id="run",
             source="kafka",
             value={"topic": "t", "partition": 0, "offset": 7},
+            source_identity=source.checkpoint_source_identity(),
         )
     )
 
@@ -1328,6 +1398,23 @@ async def test_prepare_resume_seeks_consumer_to_next_offset() -> None:
 
     assert records == ["a"]
     assert consumer.seek_calls == [(_FakeTopicPartition("t", 0), 8)]
+
+
+@pytest.mark.asyncio
+async def test_prepare_resume_rejects_checkpoint_from_different_kafka_input() -> None:
+    source = KafkaSource(topics=["events"], group_id="analytics")
+    other_source = KafkaSource(topics=["orders"], group_id="analytics")
+
+    with pytest.raises(SourceIdentityMismatchError, match="saved source identity differs"):
+        await source.prepare_resume(
+            Checkpoint(
+                pipeline_id="pipe",
+                run_id="run",
+                source="kafka",
+                value={"topic": "orders", "partition": 0, "offset": 7},
+                source_identity=other_source.checkpoint_source_identity(),
+            )
+        )
 
 
 @pytest.mark.asyncio
@@ -1525,6 +1612,7 @@ async def test_prepare_resume_seeks_all_partitions_from_offset_map() -> None:
                     {"topic": "t", "partition": 1, "offset": 3},
                 ]
             },
+            source_identity=source.checkpoint_source_identity(),
         )
     )
     consumer._messages = [  # type: ignore[attr-defined]

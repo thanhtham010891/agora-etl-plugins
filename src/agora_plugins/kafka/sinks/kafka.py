@@ -12,12 +12,14 @@ from inspect import isawaitable, iscoroutinefunction
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 import logstruct
+from agora.core.delivery import IdempotencyMode, SinkDeliveryCapability
 from agora.core.retry import RetryPolicy, retry_async
 from agora.core.sink import BaseSink
 
 from agora_plugins.kafka._lifecycle import call_lifecycle
 from agora_plugins.kafka._security_posture import warn_if_insecure_plaintext
 from agora_plugins.kafka.config import KafkaSecurityConfig
+from agora_plugins.kafka.failures import classify_kafka_failure
 from agora_plugins.kafka.sinks._message import (
     UNSET as _UNSET,
 )
@@ -139,6 +141,7 @@ class KafkaSink(BaseSink[T], Generic[T]):
             backoff_multiplier=2.0,
             max_backoff_s=2.0,
             retry_exceptions=(KafkaError,),
+            failure_classifier=classify_kafka_failure,
         )
         self._producer: AIOKafkaProducer | None = None
         self._pending_acks: deque[Any] = deque()
@@ -150,6 +153,33 @@ class KafkaSink(BaseSink[T], Generic[T]):
         message_fn_call = type(message_fn).__call__ if callable(message_fn) else None
         self._message_fn_is_async = message_fn is not None and (
             iscoroutinefunction(message_fn) or iscoroutinefunction(message_fn_call)
+        )
+
+    def delivery_capability(self) -> SinkDeliveryCapability:
+        """Report producer retry protection separately from checkpoint coupling."""
+        idempotence_enabled = bool(self._producer_kwargs.get("enable_idempotence", False))
+        if self._transaction_per_batch:
+            return SinkDeliveryCapability(
+                sink_name=self.sink_name,
+                idempotency=(
+                    IdempotencyMode.TRANSACTIONAL if idempotence_enabled else IdempotencyMode.NONE
+                ),
+                replay_safe=False,
+                notes=(
+                    "Each write_batch uses a Kafka transaction, but Agora checkpoint "
+                    "persistence is outside that transaction; crash replay can republish.",
+                ),
+            )
+        return SinkDeliveryCapability(
+            sink_name=self.sink_name,
+            idempotency=(
+                IdempotencyMode.SINK_NATIVE if idempotence_enabled else IdempotencyMode.NONE
+            ),
+            replay_safe=False,
+            notes=(
+                "Idempotent producer settings protect producer retries, not a new producer "
+                "session after an Agora checkpoint crash window.",
+            ),
         )
 
     async def startup(self) -> None:

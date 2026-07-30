@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from agora.core.retry import RetryPolicy
 
+from agora_plugins.postgres.failures import classify_postgres_failure
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -79,6 +81,7 @@ def default_source_retry_policy() -> RetryPolicy[object]:
         max_backoff_s=2.0,
         retry_exceptions=DEFAULT_SOURCE_RETRY_EXCEPTIONS,
         retry_if=is_retriable_postgres_read_error,
+        failure_classifier=classify_postgres_failure,
     )
 
 

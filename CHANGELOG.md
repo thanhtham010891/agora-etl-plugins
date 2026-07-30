@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.3 (July 25, 2026)
+
+- Raised the core compatibility floor to `agora-etl>=0.4.6,<1`. This is a
+  fail-closed packaging correction: the official backend bundle now requires
+  the core release that exports `SourceIdentity`, source-identity mismatch
+  policy, and delivery-policy preflight contracts it uses at import time.
+- Added release evidence for the first-party backend bundle: full local quality
+  verification, wheel smoke against the matching core artifact, and the
+  declarative local-backend integration matrix. Live BigQuery validation
+  remains explicitly credential- and dataset-gated.
+- Hardened delivery declarations for generic PostgreSQL and Redis writes:
+  application callback keys are not inferred replay-safe; an explicit boolean
+  contract is accepted only for PostgreSQL upserts and Redis `SET` mode.
+- Applied the shared Kafka failure classifier to source startup and polling
+  retries, so broker connectivity failures retain a consistent retry decision.
+- Added the certified Redis Streams → PostgreSQL profile. It derives a stable
+  `stream:message_id` delivery key, requires PostgreSQL flush before `XACK`,
+  and reports fail-closed acceptance findings for unsafe acknowledgement,
+  upsert, conflict-key, write-safety, replay-capability, or readiness
+  configuration. A backend-real Redis/PostgreSQL integration test proves the
+  upsert-then-ack path.
+
 ## 0.4.2 (July 16, 2026)
 
 - Hardened production delivery and recovery contracts: BigQuery checkpointing

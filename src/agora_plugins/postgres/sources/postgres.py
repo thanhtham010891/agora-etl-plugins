@@ -10,9 +10,14 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 
+from agora.core.checkpoint import Checkpoint, SourceIdentity, SourceIdentityMismatchPolicy
 from agora.core.source import BaseSource, SourceRuntimeMetrics
 from agora.core.types import SourceRecordFailurePolicy
 
+from agora_plugins._source_identity import (
+    fingerprint_source_identity,
+    validate_resume_checkpoint_identity,
+)
 from agora_plugins.postgres.connection import (
     PostgresConnectionConfig,
     coerce_connection_config,
@@ -92,6 +97,8 @@ class PostgresSource(BaseSource[T], Generic[T]):
         server_side_cursor_name: str | None = None,
         server_side_cursor_withhold: bool = False,
         connection: PostgresConnectionConfig | None = None,
+        source_identity_mismatch_policy: SourceIdentityMismatchPolicy
+        | str = SourceIdentityMismatchPolicy.FAIL_CLOSED,
     ) -> None:
         validate_postgres_source_config(
             checkpoint_field=checkpoint_field,
@@ -128,6 +135,9 @@ class PostgresSource(BaseSource[T], Generic[T]):
         self._fetch_strategy = fetch_strategy
         self._server_side_cursor_name = server_side_cursor_name
         self._server_side_cursor_withhold = server_side_cursor_withhold
+        self._source_identity_mismatch_policy = SourceIdentityMismatchPolicy(
+            source_identity_mismatch_policy
+        )
         self.supports_checkpoint = bool(
             (checkpoint_field and checkpoint_param)
             or (self._checkpoint_fields and self._checkpoint_params)
@@ -157,8 +167,31 @@ class PostgresSource(BaseSource[T], Generic[T]):
         self._stream_runtime: PostgresSourceStreamRuntime[T] = PostgresSourceStreamRuntime(self)
         self._operator_surface = PostgresSourceOperatorSurface(self)
 
-    async def prepare_resume(self, checkpoint: Any) -> None:
-        await self._resume_runtime.prepare_resume(checkpoint)
+    async def prepare_resume(self, checkpoint: Checkpoint | None) -> None:
+        await self._resume_runtime.prepare_resume(
+            validate_resume_checkpoint_identity(
+                checkpoint,
+                current_identity=self.checkpoint_source_identity(),
+                policy=self._source_identity_mismatch_policy,
+                source_name=self.source_name,
+            )
+        )
+
+    def checkpoint_source_identity(self) -> SourceIdentity:
+        """Return the secret-free identity of this query and cursor contract."""
+        return fingerprint_source_identity(
+            "postgres",
+            {
+                "base_params": self._base_params,
+                "checkpoint_field": self._checkpoint_field,
+                "checkpoint_fields": self._checkpoint_fields,
+                "checkpoint_param": self._checkpoint_param,
+                "checkpoint_params": self._checkpoint_params,
+                "connection": self._connection.redacted_dsn(),
+                "query": self._query,
+                "read_routing": self._read_routing,
+            },
+        )
 
     def current_checkpoint(self) -> dict[str, Any] | None:
         return self._resume_runtime.current_checkpoint()

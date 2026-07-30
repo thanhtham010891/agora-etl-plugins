@@ -223,6 +223,18 @@ def test_build_kafka_postgres_sink_defaults_to_delivery_key_conflict() -> None:
     )
     assert mapped["kafka_delivery_key"] == "orders:0:1"
     assert mapped["kafka_metadata"] == {"topic": "orders", "offset": 1}
+    assert sink.delivery_capability().replay_safe is True
+
+
+def test_build_kafka_postgres_sink_does_not_claim_replay_safety_without_delivery_key() -> None:
+    sink = build_kafka_postgres_sink(
+        dsn="postgresql://localhost/test",
+        table="events",
+        row_mapper=lambda row: {"event_id": row["event_id"]},
+        conflict_key="event_id",
+    )
+
+    assert sink.delivery_capability().replay_safe is False
 
 
 def test_build_kafka_postgres_sink_respects_custom_delivery_config() -> None:
@@ -751,3 +763,64 @@ def test_kafka_postgres_enterprise_acceptance_gate_reports_threshold_failures() 
     assert "source.poison_record_dlq_write_count" in metrics
     assert "source.record_error_count" in metrics
     assert "source.record_drop_count" in metrics
+
+
+def test_kafka_postgres_acceptance_gate_rejects_unsafe_replay_recipe() -> None:
+    report = KafkaPostgresEnterpriseAcceptanceGate().evaluate(
+        KafkaPostgresRuntimeMetricsSnapshot(
+            health=KafkaPostgresRuntimeHealthSnapshot(
+                ready=True,
+                source_ready=True,
+                source_stalled=False,
+                sink_connection_ready=True,
+                sink_write_safety_policy="align_to_target",
+                poison_dlq_enabled=False,
+                poison_dlq_ready=None,
+            ),
+            source=KafkaSourceMetricsSnapshot(
+                health=KafkaSourceHealthSnapshot(
+                    ready=True,
+                    stalled=False,
+                    consumer_group="orders",
+                    bootstrap_servers="kafka:9092",
+                    subscription_mode="manual_assign",
+                    assignment_count=1,
+                    paused_partition_count=0,
+                    pending_commit_count=0,
+                    rebalance_count=0,
+                    idle_poll_count=0,
+                    record_error_count=0,
+                    record_drop_count=0,
+                    total_lag=0,
+                    max_lag=0,
+                    total_commit_lag=0,
+                    max_commit_lag=0,
+                ),
+                operational=KafkaSourceOperationalMetrics(),
+                runtime=SourceRuntimeMetrics(record_error_count=0, record_drop_count=0),
+            ),
+            sink=PostgresSinkMetricsSnapshot(
+                table="events",
+                conflict_keys=("event_id",),
+                batch_size=2,
+                upsert=False,
+                insert_mode="sql",
+                pool_size=1,
+                max_rows_per_statement=None,
+                max_parameters_per_statement=32_000,
+                write_safety_policy="align_to_target",
+                buffered_row_count=0,
+                retry_count=0,
+                connection_ready=True,
+            ),
+            delivery_key_field="kafka_delivery_key",
+            delivery_metadata_field="kafka_metadata",
+        )
+    )
+
+    assert report.passed is False
+    assert {finding.metric for finding in report.findings} == {
+        "sink.delivery_key_conflict",
+        "sink.upsert",
+        "sink.write_safety_policy",
+    }

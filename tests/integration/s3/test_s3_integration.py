@@ -151,6 +151,7 @@ async def test_s3_resume_skips_completed_object_boundary() -> None:
             run_id="run-1",
             source="s3",
             value={"object_key": f"{prefix}/run_id=run-1/p=a/part-00000.jsonl"},
+            source_identity=source.checkpoint_source_identity(),
         )
     )
 
@@ -185,3 +186,45 @@ async def test_s3_sink_rejects_restart_collision_for_same_run_id() -> None:
         await restarted.close()
 
     assert caught.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_s3_sink_new_run_replay_creates_distinct_duplicate_objects() -> None:
+    """A new run id cannot deduplicate the sink-write/checkpoint crash window."""
+    _require_integration_enabled()
+    settings = _s3_settings()
+    prefix = f"integration/delivery-replay/{uuid.uuid4().hex}"
+    record = {"id": 1, "payload": "replayed"}
+
+    for run_id in ("run-before-checkpoint", "run-after-restart"):
+        sink = S3Sink(
+            bucket=settings["bucket"],
+            prefix=prefix,
+            format="jsonl",
+            run_id=run_id,
+            endpoint_url=settings["endpoint_url"],
+            aws_access_key_id=settings["aws_access_key_id"],
+            aws_secret_access_key=settings["aws_secret_access_key"],
+            region_name=settings["region_name"],
+            addressing_style="path",
+        )
+        await sink.write(record)
+        await sink.close()
+
+    source = S3Source(
+        bucket=settings["bucket"],
+        prefix=prefix,
+        format="jsonl",
+        endpoint_url=settings["endpoint_url"],
+        aws_access_key_id=settings["aws_access_key_id"],
+        aws_secret_access_key=settings["aws_secret_access_key"],
+        region_name=settings["region_name"],
+        addressing_style="path",
+    )
+    try:
+        observed = [item async for item in source.stream()]
+    finally:
+        await source.close()
+
+    assert observed == [record, record]

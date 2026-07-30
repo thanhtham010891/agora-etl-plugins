@@ -51,6 +51,14 @@ if TYPE_CHECKING:
         PostgresSourceRecoveryMode,
     )
     from agora_plugins.postgres.plugin import MANIFEST, PluginManifest
+    from agora_plugins.postgres.redis import (
+        RedisPostgresAcceptanceThresholds,
+        RedisPostgresDeliveryConfig,
+        RedisPostgresRuntime,
+        build_redis_postgres_runtime,
+        build_redis_postgres_sink,
+        with_redis_delivery_fields,
+    )
     from agora_plugins.postgres.sinks.postgres import (
         PostgresPoisonRecordClassification,
         PostgresPoisonRecordInfo,
@@ -111,10 +119,16 @@ __all__ = [
     "PostgresTLSConfig",
     "PostgresWriteSafetyPolicy",
     "QuotedIdentifier",
+    "RedisPostgresAcceptanceThresholds",
+    "RedisPostgresDeliveryConfig",
+    "RedisPostgresRuntime",
     "build_kafka_postgres_runtime",
     "build_kafka_postgres_sink",
     "build_kafka_postgres_source",
+    "build_redis_postgres_runtime",
+    "build_redis_postgres_sink",
     "with_kafka_delivery_fields",
+    "with_redis_delivery_fields",
     "wrap_kafka_postgres_deserializer",
 ]
 
@@ -179,6 +193,12 @@ _PATTERN_RECIPE_EXPORTS = frozenset(
         "build_kafka_postgres_source",
         "with_kafka_delivery_fields",
         "wrap_kafka_postgres_deserializer",
+        "RedisPostgresAcceptanceThresholds",
+        "RedisPostgresDeliveryConfig",
+        "RedisPostgresRuntime",
+        "build_redis_postgres_runtime",
+        "build_redis_postgres_sink",
+        "with_redis_delivery_fields",
     }
 )
 
@@ -190,7 +210,7 @@ def _surface_note(name: str) -> str:
         return "Stable PostgreSQL family primitive/config public surface."
     if name in _SUPPORTABILITY_PUBLIC_EXPORTS:
         return "PostgreSQL supportability, diagnostics, or observability public surface."
-    return "PostgreSQL composite Kafka wedge or pattern-oriented helper surface."
+    return "PostgreSQL composite backend wedge or pattern-oriented helper surface."
 
 
 _SURFACE_EXPORTS: dict[str, SurfaceExport] = {
@@ -343,6 +363,42 @@ _SURFACE_EXPORTS: dict[str, SurfaceExport] = {
         "wrap_kafka_postgres_deserializer",
         "pattern_recipe",
         _surface_note("wrap_kafka_postgres_deserializer"),
+    ),
+    "RedisPostgresAcceptanceThresholds": SurfaceExport(
+        "agora_plugins.postgres.redis",
+        "RedisPostgresAcceptanceThresholds",
+        "pattern_recipe",
+        _surface_note("RedisPostgresAcceptanceThresholds"),
+    ),
+    "RedisPostgresDeliveryConfig": SurfaceExport(
+        "agora_plugins.postgres.redis",
+        "RedisPostgresDeliveryConfig",
+        "pattern_recipe",
+        _surface_note("RedisPostgresDeliveryConfig"),
+    ),
+    "RedisPostgresRuntime": SurfaceExport(
+        "agora_plugins.postgres.redis",
+        "RedisPostgresRuntime",
+        "pattern_recipe",
+        _surface_note("RedisPostgresRuntime"),
+    ),
+    "build_redis_postgres_runtime": SurfaceExport(
+        "agora_plugins.postgres.redis",
+        "build_redis_postgres_runtime",
+        "pattern_recipe",
+        _surface_note("build_redis_postgres_runtime"),
+    ),
+    "build_redis_postgres_sink": SurfaceExport(
+        "agora_plugins.postgres.redis",
+        "build_redis_postgres_sink",
+        "pattern_recipe",
+        _surface_note("build_redis_postgres_sink"),
+    ),
+    "with_redis_delivery_fields": SurfaceExport(
+        "agora_plugins.postgres.redis",
+        "with_redis_delivery_fields",
+        "pattern_recipe",
+        _surface_note("with_redis_delivery_fields"),
     ),
     "PostgresDLQSinkEnterpriseAcceptanceThresholds": SurfaceExport(
         "agora_plugins.postgres.observability",

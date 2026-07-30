@@ -35,6 +35,7 @@ class RedisSourceEnterpriseAcceptanceThresholds:
     require_ready: bool = True
     require_connection_ready: bool = True
     require_group_ready: bool = True
+    require_ack_on_success: bool = True
     max_pending_ack_count: int | None = 0
     max_record_error_count: int = 0
     max_record_drop_count: int = 0
@@ -45,6 +46,7 @@ class RedisSourceEnterpriseAcceptanceThresholds:
             "require_ready": self.require_ready,
             "require_connection_ready": self.require_connection_ready,
             "require_group_ready": self.require_group_ready,
+            "require_ack_on_success": self.require_ack_on_success,
             "max_pending_ack_count": self.max_pending_ack_count,
             "max_record_error_count": self.max_record_error_count,
             "max_record_drop_count": self.max_record_drop_count,
@@ -120,6 +122,19 @@ class RedisEnterpriseAcceptanceGate:
                     metric="group_ready",
                     message="Redis stream source consumer group is not ready.",
                     value=health.group_ready,
+                    threshold=True,
+                )
+            )
+        if resolved.require_ack_on_success and not snapshot.ack_on_success:
+            findings.append(
+                RedisEnterpriseAcceptanceFinding(
+                    component="redis_source",
+                    metric="ack_on_success",
+                    message=(
+                        "Redis Streams acceptance requires ack_on_success=True so an "
+                        "entry is acknowledged only after downstream delivery succeeds."
+                    ),
+                    value=snapshot.ack_on_success,
                     threshold=True,
                 )
             )

@@ -12,8 +12,10 @@ from agora.core.checkpoint import Checkpoint, InMemoryCheckpointStore, SQLiteChe
 from agora.core.dlq import DLQRecord
 from agora.core.types import DedupStoreFailurePolicy, SourceRecordFailurePolicy
 from agora.middlewares.dedup import DedupMiddleware
+from agora.sources.file import CsvSource
 
 from agora_plugins.dlq_policy import DLQPayloadPolicy
+from agora_plugins.postgres import build_redis_postgres_runtime
 from agora_plugins.redis import (
     RedisBackend,
     RedisDLQSink,
@@ -30,6 +32,71 @@ from tests.integration._process_death import (
 
 pytestmark = pytest.mark.integration
 _INTEGRATION_TIMEOUT_S = 15.0
+
+
+@pytest.mark.asyncio
+async def test_redis_postgres_profile_upserts_before_ack_against_real_backends(
+    redis_url: str,
+    postgres_dsn: str,
+    unique_suffix: str,
+) -> None:
+    redis = pytest.importorskip("redis")
+    psycopg = pytest.importorskip("psycopg")
+    stream = f"agora:redis-postgres:{unique_suffix}"
+    group = f"writers-{unique_suffix}"
+    table = f"redis_postgres_{unique_suffix}"
+    client = redis.Redis.from_url(redis_url, decode_responses=True)
+    await asyncio.to_thread(client.xadd, stream, {"order_id": "order-1"})
+
+    async with (
+        await psycopg.AsyncConnection.connect(postgres_dsn, autocommit=True) as conn,
+        conn.cursor() as cur,
+    ):
+        await cur.execute(
+            f"CREATE TABLE {table} (redis_delivery_key TEXT PRIMARY KEY, order_id TEXT NOT NULL)"
+        )
+
+    source = RedisStreamSource(
+        url=redis_url,
+        stream=stream,
+        group=group,
+        consumer="worker-1",
+        ack_on_success=True,
+    )
+    runtime = build_redis_postgres_runtime(
+        source=source,
+        dsn=postgres_dsn,
+        table=table,
+        transform=lambda fields: {"order_id": fields["order_id"]},
+    )
+    opened = False
+    try:
+        await runtime.open()
+        opened = True
+        assert (await runtime.ensure_ready()).passed
+        await asyncio.wait_for(runtime.drain(max_records=1), timeout=_INTEGRATION_TIMEOUT_S)
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn, autocommit=True) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(f"SELECT redis_delivery_key, order_id FROM {table}")
+            row = await cur.fetchone()
+        assert row is not None
+        assert row[0].startswith(f"{stream}:")
+        assert row[1] == "order-1"
+        pending = await asyncio.to_thread(client.xpending, stream, group)
+        assert pending["pending"] == 0
+    finally:
+        if opened:
+            await runtime.close()
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn, autocommit=True) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(f"DROP TABLE IF EXISTS {table}")
+        await asyncio.to_thread(client.delete, stream)
+        await asyncio.to_thread(client.close)
 
 
 class _ReverseCipher:
@@ -95,6 +162,26 @@ class _CollectDLQSink:
 
     async def close(self) -> None:
         return None
+
+
+class _FailFirstCheckpointSave:
+    """Expose the sink-write/checkpoint crash window once for a resumed run."""
+
+    def __init__(self) -> None:
+        self._inner = InMemoryCheckpointStore()
+        self._failed = False
+
+    async def load(self, key: str):
+        return await self._inner.load(key)
+
+    async def save(self, key: str, checkpoint) -> None:
+        if not self._failed:
+            self._failed = True
+            raise RuntimeError("checkpoint save interrupted after sink write")
+        await self._inner.save(key, checkpoint)
+
+    async def close(self) -> None:
+        await self._inner.close()
 
 
 class _FailAfterPipelineExecute:
@@ -562,6 +649,73 @@ async def test_redis_sink_list_retry_does_not_duplicate_against_real_redis(
 
 
 @pytest.mark.asyncio
+async def test_redis_set_replay_after_checkpoint_save_failure_overwrites_same_keys(
+    redis_url: str,
+    unique_suffix: str,
+    tmp_path,
+) -> None:
+    """A replay repeats SET, so Redis retains one value per deterministic key."""
+    redis = pytest.importorskip("redis")
+    key_prefix = f"agora:redis:checkpoint-replay:{unique_suffix}"
+    source_path = tmp_path / "records.csv"
+    source_path.write_text("id,payload\n1,alpha\n2,bravo\n", encoding="utf-8")
+    checkpoint_store = _FailFirstCheckpointSave()
+    pipeline_id = f"redis-set-replay-{unique_suffix}"
+    client = redis.Redis.from_url(redis_url, decode_responses=True)
+
+    def _sink() -> RedisSink[dict[str, str]]:
+        return RedisSink(
+            url=redis_url,
+            key_fn=lambda record: f"{key_prefix}:{record['id']}",
+            serializer=lambda record: json.dumps(record, sort_keys=True),
+            mode="set",
+        )
+
+    try:
+        with pytest.raises(RuntimeError, match="checkpoint save interrupted"):
+            await asyncio.wait_for(
+                (
+                    Pipeline(
+                        CsvSource(source_path, row_mapper=lambda row: row),
+                        id=pipeline_id,
+                    )
+                    .build(_sink(), config=DeliveryConfig(checkpoint=checkpoint_store))
+                    .run()
+                ),
+                timeout=_INTEGRATION_TIMEOUT_S,
+            )
+
+        replay_summary = await asyncio.wait_for(
+            (
+                Pipeline(
+                    CsvSource(source_path, row_mapper=lambda row: row),
+                    id=pipeline_id,
+                )
+                .build(_sink(), config=DeliveryConfig(checkpoint=checkpoint_store))
+                .run()
+            ),
+            timeout=_INTEGRATION_TIMEOUT_S,
+        )
+
+        values = {
+            key: json.loads(client.get(key) or "{}")
+            for key in (f"{key_prefix}:1", f"{key_prefix}:2")
+        }
+    finally:
+        await checkpoint_store.close()
+        keys = list(client.scan_iter(match=f"{key_prefix}:*"))
+        if keys:
+            client.delete(*keys)
+        client.close()
+
+    assert replay_summary.records_written == 2
+    assert values == {
+        f"{key_prefix}:1": {"id": "1", "payload": "alpha"},
+        f"{key_prefix}:2": {"id": "2", "payload": "bravo"},
+    }
+
+
+@pytest.mark.asyncio
 async def test_redis_dlq_round_trip_replay_and_acknowledge_against_real_redis(
     redis_url: str,
     unique_suffix: str,
@@ -948,6 +1102,7 @@ async def test_redis_stream_resume_rejects_multi_consumer_group_against_real_red
                 run_id="run",
                 source="redis_stream",
                 value={"message_id": message_ids[0]},
+                source_identity=source.checkpoint_source_identity(),
             )
         )
 

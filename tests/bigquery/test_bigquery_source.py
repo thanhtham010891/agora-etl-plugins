@@ -7,6 +7,7 @@ from types import ModuleType
 import pytest
 from agora import Checkpoint
 from agora.core.acceptance import AcceptanceReport
+from agora.core.checkpoint import SourceIdentityMismatchError
 from agora.core.data_plane import DataPlane
 from agora.core.health import ComponentHealthSnapshot
 from agora.core.types import SourceRecordFailurePolicy
@@ -112,6 +113,7 @@ async def test_bigquery_source_builds_checkpointable_table_query(
             run_id="run-1",
             source="bigquery",
             value={"cursor": 2},
+            source_identity=source.checkpoint_source_identity(),
         )
     )
 
@@ -132,6 +134,68 @@ async def test_bigquery_source_builds_checkpointable_table_query(
     assert source.current_checkpoint() == {"row_number": 2, "cursor": 4}
     assert source.recovery_contract().mode.value == "checkpoint_rerun"
     assert source.data_plane_spec().emitted_plane == DataPlane.PYTHON_ROWS
+
+
+@pytest.mark.asyncio
+async def test_bigquery_table_source_rejects_checkpoint_from_different_identity(
+    fake_bigquery_module: None,
+) -> None:
+    original = BigQuerySource(
+        table="analytics.orders",
+        checkpoint_column="id",
+        checkpoint_column_is_unique=True,
+        client=_FakeClient([]),
+    )
+    resumed = BigQuerySource(
+        table="analytics.payments",
+        checkpoint_column="id",
+        checkpoint_column_is_unique=True,
+        client=_FakeClient([]),
+    )
+
+    with pytest.raises(SourceIdentityMismatchError, match="saved source identity differs"):
+        await resumed.prepare_resume(
+            Checkpoint(
+                pipeline_id="events",
+                run_id="run-1",
+                source="bigquery",
+                value={"cursor": 2},
+                source_identity=original.checkpoint_source_identity(),
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_bigquery_table_source_reset_policy_discards_mismatched_checkpoint(
+    fake_bigquery_module: None,
+) -> None:
+    original = BigQuerySource(
+        table="analytics.orders",
+        checkpoint_column="id",
+        checkpoint_column_is_unique=True,
+        client=_FakeClient([]),
+    )
+    client = _FakeClient([{"id": 1}, {"id": 2}])
+    resumed = BigQuerySource(
+        table="analytics.payments",
+        checkpoint_column="id",
+        checkpoint_column_is_unique=True,
+        client=client,
+        source_identity_mismatch_policy="reset",
+    )
+
+    await resumed.prepare_resume(
+        Checkpoint(
+            pipeline_id="events",
+            run_id="run-1",
+            source="bigquery",
+            value={"cursor": 99},
+            source_identity=original.checkpoint_source_identity(),
+        )
+    )
+
+    assert [record async for record in resumed.stream()] == [{"id": 1}, {"id": 2}]
+    assert "WHERE id > @checkpoint_cursor" not in client.query_calls[0][0]
 
 
 @pytest.mark.asyncio
@@ -300,6 +364,7 @@ async def test_bigquery_source_composite_checkpoint_resumes_rows_with_duplicate_
             run_id="run-1",
             source="bigquery",
             value={"cursor": {"cursor": 42, "tiebreaker_cursor": 1}},
+            source_identity=source.checkpoint_source_identity(),
         )
     )
 

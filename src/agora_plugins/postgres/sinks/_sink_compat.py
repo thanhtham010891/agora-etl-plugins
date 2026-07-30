@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from agora.core.retry import RetryPolicy
 
+from agora_plugins.postgres.failures import classify_postgres_failure
 from agora_plugins.postgres.sinks._identifiers import QuotedIdentifier, _table_lookup_condition
 from agora_plugins.postgres.sinks._sink_types import (
     PostgresPoisonRecordClassification,
@@ -75,6 +76,7 @@ class PostgresSinkCompatMixin:
             backoff_multiplier=2.0,
             max_backoff_s=2.0,
             retry_exceptions=(self._psycopg.OperationalError, self._psycopg.InterfaceError),
+            failure_classifier=classify_postgres_failure,
         )
 
     def _build_upsert_sql(self, columns: Sequence[str | QuotedIdentifier]) -> str:

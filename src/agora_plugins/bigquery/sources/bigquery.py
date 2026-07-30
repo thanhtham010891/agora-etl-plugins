@@ -7,9 +7,14 @@ from inspect import Parameter, isawaitable, signature
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast
 
 import logstruct
+from agora.core.checkpoint import Checkpoint, SourceIdentity, SourceIdentityMismatchPolicy
 from agora.core.source import BaseSource, SourceRuntimeMetrics
 from agora.core.types import SourceRecordFailurePolicy
 
+from agora_plugins._source_identity import (
+    fingerprint_source_identity,
+    validate_resume_checkpoint_identity,
+)
 from agora_plugins.bigquery.config import (
     BigQueryConnectionConfig,
     build_bigquery_client,
@@ -29,7 +34,6 @@ from agora_plugins.bigquery.sources.stream_runtime import BigQuerySourceStreamRu
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 
-    from agora.core.checkpoint import Checkpoint
     from agora.core.context import PipelineContext
 
 T = TypeVar("T")
@@ -87,6 +91,8 @@ class BigQuerySource(BaseSource[T], Generic[T]):
         credentials: Any | None = None,
         connection: BigQueryConnectionConfig | None = None,
         client: Any | None = None,
+        source_identity_mismatch_policy: SourceIdentityMismatchPolicy
+        | str = SourceIdentityMismatchPolicy.FAIL_CLOSED,
     ) -> None:
         if (table is None) == (query is None):
             raise ValueError("Provide exactly one of table=... or query=....")
@@ -161,6 +167,9 @@ class BigQuerySource(BaseSource[T], Generic[T]):
             connection=connection,
         )
         self._client = client
+        self._source_identity_mismatch_policy = SourceIdentityMismatchPolicy(
+            source_identity_mismatch_policy
+        )
         self._resume_cursor: Any | None = None
         self._rows_seen = 0
         self._emitted_record_count = 0
@@ -236,6 +245,14 @@ class BigQuerySource(BaseSource[T], Generic[T]):
         self._last_checkpoint_cursor = None
         if checkpoint is None or not self.supports_checkpoint:
             return
+        checkpoint = validate_resume_checkpoint_identity(
+            checkpoint,
+            current_identity=self.checkpoint_source_identity(),
+            policy=self._source_identity_mismatch_policy,
+            source_name=self.source_name,
+        )
+        if checkpoint is None:
+            return
         value = checkpoint.value if isinstance(checkpoint.value, dict) else {}
         self._resume_cursor = value.get("cursor")
         if (
@@ -247,6 +264,24 @@ class BigQuerySource(BaseSource[T], Generic[T]):
                 "Cannot resume BigQuery composite checkpoint from a legacy scalar cursor. "
                 "Start a new run or migrate the saved checkpoint."
             )
+
+    def checkpoint_source_identity(self) -> SourceIdentity:
+        """Return a secret-free identity for the configured BigQuery input."""
+        return fingerprint_source_identity(
+            "bigquery",
+            {
+                "mode": self._mode,
+                "table": self._table,
+                "query": self._query,
+                "query_parameters": self._query_parameters,
+                "columns": self._columns,
+                "order_by": self._order_by,
+                "checkpoint_column": self._checkpoint_column,
+                "checkpoint_tiebreaker_column": self._checkpoint_tiebreaker_column,
+                "project": self._connection.project,
+                "location": self._connection.location,
+            },
+        )
 
     def current_checkpoint(self) -> dict[str, Any] | None:
         if self._rows_seen <= 0 and self._last_checkpoint_cursor is None:

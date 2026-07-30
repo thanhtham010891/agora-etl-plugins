@@ -15,10 +15,12 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar
 from urllib.parse import urlparse
 
 import logstruct
+from agora.core.delivery import IdempotencyMode, SinkDeliveryCapability
 from agora.core.retry import RetryPolicy, retry_async
 from agora.core.sink import BaseSink
 
 from agora_plugins.redis.connection import build_async_redis_client
+from agora_plugins.redis.failures import classify_redis_failure
 from agora_plugins.redis.observability import (
     RedisEnterpriseAcceptanceGate,
     RedisPrometheusExporter,
@@ -158,9 +160,14 @@ class RedisSink(BaseSink[T], Generic[T]):
         sentinel_service_name: str | None = None,
         sentinel_urls: list[str] | None = None,
         retry_policy: RetryPolicy[Any] | None = None,
+        replay_safe_key_contract: bool = False,
     ) -> None:
         if mode not in _MODES:
             raise ValueError(f"RedisSink: invalid mode {mode!r}. Choose from {_MODES}")
+        if not isinstance(replay_safe_key_contract, bool):
+            raise TypeError("RedisSink: replay_safe_key_contract must be a bool")
+        if replay_safe_key_contract and mode != "set":
+            raise ValueError("RedisSink: replay_safe_key_contract=True requires mode='set'")
         if ttl_seconds is not None and mode != "set":
             raise ValueError(
                 f"RedisSink: ttl_seconds is only supported for mode='set', got {mode!r}"
@@ -180,6 +187,7 @@ class RedisSink(BaseSink[T], Generic[T]):
         self._sentinel_service_name = sentinel_service_name
         self._sentinel_urls = list(sentinel_urls or [])
         self._retry_policy = retry_policy
+        self._replay_safe_key_contract = replay_safe_key_contract
         self._client: Any | None = None
         self._xadd_kwargs: dict[str, Any] = {}
         self._write_call_count = 0
@@ -193,6 +201,40 @@ class RedisSink(BaseSink[T], Generic[T]):
         self._last_write_at: datetime | None = None
         if maxlen is not None:
             self._xadd_kwargs = {"maxlen": maxlen, "approximate": True}
+
+    def delivery_capability(self) -> SinkDeliveryCapability:
+        """Describe mode-specific replay behavior without overstating Redis guarantees."""
+        if self._mode == "set":
+            return SinkDeliveryCapability(
+                sink_name=self.sink_name,
+                idempotency=IdempotencyMode.APPLICATION_MANAGED,
+                replay_safe=self._replay_safe_key_contract,
+                notes=(
+                    "SET overwrites the same key, but key_fn determinism is application-owned. "
+                    + (
+                        "The caller explicitly guarantees a stable key for replay."
+                        if self._replay_safe_key_contract
+                        else "Set replay_safe_key_contract=True only when key_fn is derived "
+                        "from a stable delivery identity."
+                    ),
+                ),
+            )
+        if self._mode in {"lpush", "rpush"}:
+            return SinkDeliveryCapability(
+                sink_name=self.sink_name,
+                idempotency=IdempotencyMode.SINK_NATIVE,
+                replay_safe=False,
+                notes=(
+                    "Lua markers deduplicate retry attempts for one write operation; "
+                    "a crash replay creates a new operation id and can append again.",
+                ),
+            )
+        return SinkDeliveryCapability(
+            sink_name=self.sink_name,
+            idempotency=IdempotencyMode.NONE,
+            replay_safe=False,
+            notes=("XADD creates a new stream entry on replay.",),
+        )
 
     async def open(self) -> None:
         try:
@@ -401,6 +443,7 @@ class RedisSink(BaseSink[T], Generic[T]):
             max_backoff_s=1.0,
             jitter_ratio=0.2,
             retry_exceptions=retry_exceptions,
+            failure_classifier=classify_redis_failure,
         )
 
     async def _retry_redis_command(

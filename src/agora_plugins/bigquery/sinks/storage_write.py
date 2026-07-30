@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Generic, TypeVar
 
 from agora.core.data_plane import DataPlane
+from agora.core.delivery import IdempotencyMode, SinkDeliveryCapability
 from agora.core.sink import BaseSink
 
 from agora_plugins.bigquery.config import (
@@ -174,6 +175,17 @@ class BigQueryStorageWriteSink(BigQueryStorageWriteCompatMixin[T], BaseSink[T], 
     sink_name = "bigquery_storage_write"
     accepted_data_planes = (DataPlane.PYTHON_ROWS, DataPlane.PYTHON_BATCHES)
     native_data_planes = accepted_data_planes
+
+    def delivery_capability(self) -> SinkDeliveryCapability:
+        """Default-stream appends remain duplicate-tolerant after ambiguous failure."""
+        return SinkDeliveryCapability(
+            sink_name=self.sink_name,
+            idempotency=IdempotencyMode.NONE,
+            replay_safe=False,
+            notes=(
+                "An ambiguous Storage Write append timeout followed by replay can duplicate rows.",
+            ),
+        )
 
     def __init__(
         self,

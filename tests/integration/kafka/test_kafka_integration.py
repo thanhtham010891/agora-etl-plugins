@@ -8,8 +8,10 @@ from datetime import UTC, datetime
 import pytest
 from agora import DeliveryConfig, Pipeline
 from agora.core.checkpoint import Checkpoint, InMemoryCheckpointStore, SQLiteCheckpointStore
+from agora.core.delivery import DeliveryPolicy, DeliveryPolicyMismatchError
 from agora.core.dlq import DLQRecord
 from agora.core.source import IterableSource
+from agora.sources.file import CsvSource
 
 from agora_plugins.kafka import (
     DLQPayloadPolicy,
@@ -85,6 +87,26 @@ class _FailingDLQSink:
 
     async def close(self) -> None:
         return None
+
+
+class _FailFirstCheckpointSave:
+    """Persist no checkpoint on the first delivery, then permit resumed replay."""
+
+    def __init__(self) -> None:
+        self._inner = InMemoryCheckpointStore()
+        self._failed = False
+
+    async def load(self, key: str):
+        return await self._inner.load(key)
+
+    async def save(self, key: str, checkpoint) -> None:
+        if not self._failed:
+            self._failed = True
+            raise RuntimeError("checkpoint save interrupted after sink write")
+        await self._inner.save(key, checkpoint)
+
+    async def close(self) -> None:
+        await self._inner.close()
 
 
 class _FailingOffsetsKafkaSink(KafkaSink[dict[str, object]]):
@@ -403,6 +425,78 @@ async def test_kafka_idempotent_sink_survives_broker_flap_without_duplicates(
     assert len(collected) == len(records)
     assert len(set(seen_ids)) == len(records)
     assert sorted(seen_ids) == list(range(len(records)))
+
+
+@pytest.mark.asyncio
+async def test_kafka_sink_replay_after_checkpoint_save_failure_republishes_and_policy_rejects_it(
+    kafka_bootstrap: str,
+    unique_suffix: str,
+    tmp_path,
+) -> None:
+    """Producer retries are idempotent, but a new producer session can republish replayed rows."""
+    pytest.importorskip("aiokafka")
+    topic = f"agora-it-checkpoint-replay-{unique_suffix}"
+    source_path = tmp_path / "records.csv"
+    source_path.write_text("id,name\n1,alpha\n2,bravo\n", encoding="utf-8")
+    checkpoint_store = _FailFirstCheckpointSave()
+    pipeline_id = f"kafka-sink-replay-{unique_suffix}"
+
+    await asyncio.wait_for(_ensure_topic_exists(kafka_bootstrap, topic), timeout=10.0)
+
+    def _sink() -> KafkaSink[dict[str, str]]:
+        return KafkaSink(
+            topic=topic,
+            bootstrap_servers=kafka_bootstrap,
+            serializer=lambda record: json.dumps(record, sort_keys=True).encode("utf-8"),
+        )
+
+    blocked = Pipeline(CsvSource(source_path, row_mapper=lambda row: row), id=pipeline_id).build(
+        _sink(),
+        config=DeliveryConfig(
+            checkpoint=InMemoryCheckpointStore(),
+            delivery_policy=DeliveryPolicy(require_replay_safe=True),
+        ),
+    )
+    with pytest.raises(DeliveryPolicyMismatchError, match="sink_not_replay_safe"):
+        await blocked.run()
+
+    try:
+        with pytest.raises(RuntimeError, match="checkpoint save interrupted"):
+            await asyncio.wait_for(
+                (
+                    Pipeline(
+                        CsvSource(source_path, row_mapper=lambda row: row),
+                        id=pipeline_id,
+                    )
+                    .build(_sink(), config=DeliveryConfig(checkpoint=checkpoint_store))
+                    .run()
+                ),
+                timeout=_INTEGRATION_TIMEOUT_S,
+            )
+
+        replay_summary = await asyncio.wait_for(
+            (
+                Pipeline(
+                    CsvSource(source_path, row_mapper=lambda row: row),
+                    id=pipeline_id,
+                )
+                .build(_sink(), config=DeliveryConfig(checkpoint=checkpoint_store))
+                .run()
+            ),
+            timeout=_INTEGRATION_TIMEOUT_S,
+        )
+        await asyncio.sleep(1.0)
+        published = await _collect_kafka_topic(
+            bootstrap_servers=kafka_bootstrap,
+            topic=topic,
+            group_id=f"kafka-sink-replay-observer-{unique_suffix}",
+            max_records=3,
+        )
+    finally:
+        await checkpoint_store.close()
+
+    assert replay_summary.records_written == 2
+    assert [record["id"] for record in published] == ["1", "1", "2"]
 
 
 @pytest.mark.asyncio
@@ -1072,6 +1166,19 @@ async def test_kafka_resume_from_mixed_partition_offset_checkpoint_map(
         timeout=_INTEGRATION_TIMEOUT_S,
     )
 
+    source = KafkaSource(
+        assignments=[(topic, 0), (topic, 1)],
+        bootstrap_servers=kafka_bootstrap,
+        group_id=f"agora-it-resume-mix-{unique_suffix}",
+        deserializer=lambda value, metadata: {
+            "payload": json.loads(value.decode("utf-8")),
+            "metadata": metadata,
+        },
+        auto_offset_reset="earliest",
+        enable_auto_commit=False,
+        commit_every=1,
+    )
+
     await store.save(
         "kafka",
         Checkpoint(
@@ -1084,6 +1191,7 @@ async def test_kafka_resume_from_mixed_partition_offset_checkpoint_map(
                     {"topic": topic, "partition": 1, "offset": 2},
                 ]
             },
+            source_identity=source.checkpoint_source_identity(),
         ),
     )
 
@@ -1092,20 +1200,7 @@ async def test_kafka_resume_from_mixed_partition_offset_checkpoint_map(
     collected = _CollectSink()
     consumer_summary = await asyncio.wait_for(
         (
-            Pipeline(
-                KafkaSource(
-                    assignments=[(topic, 0), (topic, 1)],
-                    bootstrap_servers=kafka_bootstrap,
-                    group_id=f"agora-it-resume-mix-{unique_suffix}",
-                    deserializer=lambda value, metadata: {
-                        "payload": json.loads(value.decode("utf-8")),
-                        "metadata": metadata,
-                    },
-                    auto_offset_reset="earliest",
-                    enable_auto_commit=False,
-                    commit_every=1,
-                )
-            )
+            Pipeline(source)
             .build(
                 collected,  # type: ignore[arg-type]
                 config=DeliveryConfig(checkpoint=store),

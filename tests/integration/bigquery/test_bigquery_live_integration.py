@@ -393,6 +393,7 @@ async def test_bigquery_live_table_source_checkpoint_resume_across_multiple_cycl
                 run_id="resume-1",
                 source="bigquery",
                 value={"cursor": 1},
+                source_identity=table_source.checkpoint_source_identity(),
             )
         )
         resumed_rows = [row async for row in table_source.stream()]
@@ -408,6 +409,7 @@ async def test_bigquery_live_table_source_checkpoint_resume_across_multiple_cycl
                 run_id="resume-2",
                 source="bigquery",
                 value={"cursor": 2},
+                source_identity=table_source.checkpoint_source_identity(),
             )
         )
         final_rows = [row async for row in table_source.stream()]

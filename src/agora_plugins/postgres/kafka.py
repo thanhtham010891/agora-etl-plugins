@@ -156,6 +156,12 @@ def build_kafka_postgres_sink(
         "str | list[str | QuotedIdentifier]",
         conflict_key or resolved_delivery.key_field,
     )
+    conflict_keys = (
+        (resolved_conflict_key,)
+        if isinstance(resolved_conflict_key, (str, QuotedIdentifier))
+        else tuple(resolved_conflict_key)
+    )
+    replay_safe_delivery_contract = upsert and resolved_delivery.key_field in conflict_keys
     return PostgresSink[dict[str, Any]](
         dsn=dsn,
         table=table,
@@ -168,6 +174,7 @@ def build_kafka_postgres_sink(
         max_rows_per_statement=max_rows_per_statement,
         max_parameters_per_statement=max_parameters_per_statement,
         retry_policy=retry_policy,
+        replay_safe_key_contract=replay_safe_delivery_contract,
         connection=connection,
     )
 

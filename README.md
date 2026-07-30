@@ -72,7 +72,7 @@ pip install "agora-etl-plugins[all]"          # Everything in one install
 ```
 
 This package tracks the `agora-etl 0.4.x` compatibility line.
-Current floor: `agora-etl>=0.4.5,<1`.
+Current floor: `agora-etl>=0.4.6,<1`.
 Supported Python versions: `3.11`, `3.12`, and `3.13`.
 
 The bundle focuses on a small set of official backend families and helpers:

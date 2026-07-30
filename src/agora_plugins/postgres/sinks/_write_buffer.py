@@ -49,4 +49,14 @@ class PostgresSinkWriteBuffer:
                 await sink.flush()
             except PostgresSinkWriteError as exc:
                 await sink._route_failed_buffer_to_dlq(exc)
+                # With a one-row sink batch, a classified permanent database
+                # rejection belongs to the delivery layer's error/DLQ policy.
+                # Retaining it here would make writer.close() retry the same
+                # rejected row after that policy has already handled it.
+                if (
+                    sink._poison_record_sink is None
+                    and sink._batch_size == 1
+                    and exc.poison_info.classification.value != "unknown"
+                ):
+                    sink._buffer.clear()
                 raise

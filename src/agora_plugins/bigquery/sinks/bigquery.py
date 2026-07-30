@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 
 import logstruct
+from agora.core.delivery import IdempotencyMode, SinkDeliveryCapability
 from agora.core.sink import BaseSink
 
 from agora_plugins.bigquery.config import (
@@ -56,6 +57,15 @@ class BigQuerySink(BaseSink[T], Generic[T]):
     """Write mapped rows into a BigQuery table via load jobs."""
 
     sink_name = "bigquery"
+
+    def delivery_capability(self) -> SinkDeliveryCapability:
+        """Load jobs are append/truncate operations, not replay-safe upserts."""
+        return SinkDeliveryCapability(
+            sink_name=self.sink_name,
+            idempotency=IdempotencyMode.NONE,
+            replay_safe=False,
+            notes=("Batch load jobs do not provide merge or upsert semantics.",),
+        )
 
     def __init__(
         self,

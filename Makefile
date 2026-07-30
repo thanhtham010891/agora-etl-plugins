@@ -18,7 +18,7 @@ WHEEL_PYTHON := $(WHEEL_VENV)/bin/python
 WHEEL_PIP := $(WHEEL_VENV)/bin/pip
 WHEEL_PYTEST := $(WHEEL_VENV)/bin/pytest
 WHEEL_PIP_INDEX_URL ?= https://pypi.org/simple
-WHEEL_CORE_REQUIREMENT ?= agora-etl==0.4.5
+WHEEL_CORE_REQUIREMENT ?= agora-etl==0.4.6
 WHEEL_CORE_SOURCE ?=
 WHEEL_CORE_INSTALL := $(if $(strip $(WHEEL_CORE_SOURCE)),$(WHEEL_CORE_SOURCE),$(WHEEL_CORE_REQUIREMENT))
 DIST_WHEEL = $(firstword $(wildcard dist/*.whl))

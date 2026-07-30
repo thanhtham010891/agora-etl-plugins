@@ -222,5 +222,12 @@ class RedisReadLoopRuntime:
                     raise source_error from exc
 
                 self._source._delivery_success_hook = self._source._build_ack_callback(msg_id)
+                self._source._delivery_context = self._source._build_delivery_context(
+                    normalized_message_id
+                )
                 self._source._emitted_record_count += 1
-                yield record
+                try:
+                    yield record
+                finally:
+                    self._source._delivery_success_hook = None
+                    self._source._delivery_context = None

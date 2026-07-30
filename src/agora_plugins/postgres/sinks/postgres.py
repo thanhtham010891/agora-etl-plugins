@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 
+from agora.core.delivery import IdempotencyMode, SinkDeliveryCapability
 from agora.core.sink import BaseSink
 
 from agora_plugins.postgres.connection import (
@@ -90,6 +91,7 @@ class PostgresSink(PostgresSinkCompatMixin, BaseSink[T], Generic[T]):
         max_parameters_per_statement: int = 32_000,
         retry_policy: RetryPolicy[Any] | None = None,
         write_safety_policy: PostgresWriteSafetyPolicy | str = PostgresWriteSafetyPolicy.STRICT,
+        replay_safe_key_contract: bool = False,
         connection: PostgresConnectionConfig | None = None,
         poison_record_sink: DLQSink | None = None,
         poison_record_pipeline_id: str | None = None,
@@ -104,6 +106,10 @@ class PostgresSink(PostgresSinkCompatMixin, BaseSink[T], Generic[T]):
             raise ValueError("insert_mode must be 'sql', 'copy', or 'copy_merge'")
         if upsert and insert_mode == "copy":
             raise ValueError("insert_mode='copy' is only supported when upsert=False")
+        if not isinstance(replay_safe_key_contract, bool):
+            raise TypeError("replay_safe_key_contract must be a bool")
+        if replay_safe_key_contract and not upsert:
+            raise ValueError("replay_safe_key_contract=True requires upsert=True")
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
         if pool_size < 1:
@@ -133,6 +139,7 @@ class PostgresSink(PostgresSinkCompatMixin, BaseSink[T], Generic[T]):
         self._max_parameters_per_statement = max_parameters_per_statement
         self._retry_policy = retry_policy
         self._write_safety_policy = _resolve_write_safety_policy(write_safety_policy)
+        self._replay_safe_key_contract = replay_safe_key_contract
         self._poison_record_sink = poison_record_sink
         self._poison_record_pipeline_id = poison_record_pipeline_id or f"postgres:{table}"
         self._poison_record_max_attempts = poison_record_max_attempts
@@ -249,6 +256,31 @@ class PostgresSink(PostgresSinkCompatMixin, BaseSink[T], Generic[T]):
             write_connection=self._write_connection,
             note_flush_success=self._runtime_state.note_flush_success,
             now_utc=_now_utc,
+        )
+
+    def delivery_capability(self) -> SinkDeliveryCapability:
+        """Declare replay safety only after an explicit stable-key contract."""
+        if self._upsert:
+            return SinkDeliveryCapability(
+                sink_name=self.sink_name,
+                idempotency=IdempotencyMode.APPLICATION_MANAGED,
+                replay_safe=self._replay_safe_key_contract,
+                notes=(
+                    "Upsert preflight validates the configured conflict key. "
+                    + (
+                        "The caller explicitly guarantees that its row mapper emits a stable "
+                        "conflict key, so replay updates the same target identity."
+                        if self._replay_safe_key_contract
+                        else "The row mapper's conflict-key stability is not machine-verifiable; "
+                        "set replay_safe_key_contract=True only after establishing that contract."
+                    ),
+                ),
+            )
+        return SinkDeliveryCapability(
+            sink_name=self.sink_name,
+            idempotency=IdempotencyMode.NONE,
+            replay_safe=False,
+            notes=("Append-only insert and COPY modes can duplicate rows on replay.",),
         )
 
     def invalidate_target_columns_cache(self) -> None:

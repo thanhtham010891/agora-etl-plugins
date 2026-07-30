@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 from uuid import uuid4
 
 from agora.core.data_plane import DataPlane
+from agora.core.delivery import IdempotencyMode, SinkDeliveryCapability
 from agora.core.sink import BaseSink
 
 from agora_plugins.s3.config import S3ConnectionConfig, build_s3_client, coerce_connection_config
@@ -27,6 +28,18 @@ class S3Sink(BaseSink[T], Generic[T]):
     sink_name = "s3"
     accepted_data_planes = (DataPlane.PYTHON_ROWS, DataPlane.PYTHON_BATCHES)
     native_data_planes = accepted_data_planes
+
+    def delivery_capability(self) -> SinkDeliveryCapability:
+        """Conditional object creation prevents overwrite but not new-run duplicates."""
+        return SinkDeliveryCapability(
+            sink_name=self.sink_name,
+            idempotency=IdempotencyMode.NONE,
+            replay_safe=False,
+            notes=(
+                "Run-scoped conditional creates fail on a same-run collision; a new run id "
+                "creates distinct objects during replay.",
+            ),
+        )
 
     def __init__(
         self,

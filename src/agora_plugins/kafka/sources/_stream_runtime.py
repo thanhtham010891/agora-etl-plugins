@@ -6,6 +6,7 @@ import asyncio
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 import logstruct
+from agora.core.retry import RetryPolicy, retry_async
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -45,6 +46,7 @@ class KafkaStreamRuntime(Generic[T]):
         bootstrap_consumer_state: Callable[[Any | None], Awaitable[None]],
         commit_if_needed: Callable[..., Awaitable[None]],
         on_state_changed: Callable[[], None],
+        retry_policy: RetryPolicy[Any],
     ) -> None:
         self._group_id = group_id
         self._topics = list(topics)
@@ -63,6 +65,7 @@ class KafkaStreamRuntime(Generic[T]):
         self._bootstrap_consumer_state = bootstrap_consumer_state
         self._commit_if_needed = commit_if_needed
         self._on_state_changed = on_state_changed
+        self._retry_policy = retry_policy
 
     async def stream(self, *, consumer: Any) -> AsyncGenerator[T, None]:
         self._delivery_controller.reset_run_state()
@@ -98,9 +101,12 @@ class KafkaStreamRuntime(Generic[T]):
         idle_polls = 0
         while True:
             try:
-                batches = await getmany(
-                    timeout_ms=self._poll_timeout_ms,
-                    max_records=self._max_poll_records,
+                batches = await retry_async(
+                    lambda: getmany(
+                        timeout_ms=self._poll_timeout_ms,
+                        max_records=self._max_poll_records,
+                    ),
+                    policy=self._retry_policy,
                 )
                 self._runtime_state.record_poll()
             except StopAsyncIteration:

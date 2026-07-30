@@ -11,6 +11,7 @@ from agora.core.dlq import DLQRecord
 from agora.core.middleware import Middleware
 from agora.core.retry import RetryPolicy
 from agora.core.types import CheckpointFailurePolicy, DLQFailurePolicy, SinkFailurePolicy
+from agora.sources.file import CsvSource
 
 from agora_plugins.dlq_policy import DLQPayloadPolicy
 from agora_plugins.postgres import (
@@ -87,6 +88,26 @@ class _FailingCheckpointStore:
 
     async def close(self) -> None:
         return None
+
+
+class _FailFirstCheckpointSave:
+    """Expose the write-then-checkpoint crash window once, then allow resume."""
+
+    def __init__(self) -> None:
+        self._inner = InMemoryCheckpointStore()
+        self._failed = False
+
+    async def load(self, key: str):
+        return await self._inner.load(key)
+
+    async def save(self, key: str, checkpoint) -> None:
+        if not self._failed:
+            self._failed = True
+            raise RuntimeError("checkpoint save interrupted after sink write")
+        await self._inner.save(key, checkpoint)
+
+    async def close(self) -> None:
+        await self._inner.close()
 
 
 async def _set_replica_replay_paused(
@@ -364,6 +385,82 @@ async def test_postgres_sink_upsert_last_wins_across_batches_against_real_databa
         ("b", "bravo-v2", 2),
         ("c", "charlie-v1", 1),
     ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_upsert_replay_after_checkpoint_save_failure_keeps_one_row_per_key(
+    postgres_dsn: str,
+    unique_suffix: str,
+    tmp_path,
+) -> None:
+    """A replay from an unsaved checkpoint reuses the PostgreSQL conflict key."""
+    psycopg = pytest.importorskip("psycopg")
+    table = f"agora_upsert_checkpoint_replay_{unique_suffix}"
+    source_path = tmp_path / "orders.csv"
+    source_path.write_text("slug,display_name\na,alpha\nb,bravo\n", encoding="utf-8")
+    checkpoint_store = _FailFirstCheckpointSave()
+    pipeline_id = f"postgres-upsert-replay-{unique_suffix}"
+
+    conn = await psycopg.AsyncConnection.connect(postgres_dsn, autocommit=True)
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                CREATE TABLE "{table}" (
+                    slug TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL
+                )
+                """
+            )
+
+        with pytest.raises(RuntimeError, match="checkpoint save interrupted"):
+            await asyncio.wait_for(
+                (
+                    Pipeline(CsvSource(source_path, row_mapper=lambda row: row), id=pipeline_id)
+                    .build(
+                        PostgresSink(
+                            dsn=postgres_dsn,
+                            table=table,
+                            row_mapper=lambda row: row,
+                            conflict_key="slug",
+                            batch_size=1,
+                        ),
+                        config=DeliveryConfig(checkpoint=checkpoint_store),
+                    )
+                    .run()
+                ),
+                timeout=_INTEGRATION_TIMEOUT_S,
+            )
+
+        replay_summary = await asyncio.wait_for(
+            (
+                Pipeline(CsvSource(source_path, row_mapper=lambda row: row), id=pipeline_id)
+                .build(
+                    PostgresSink(
+                        dsn=postgres_dsn,
+                        table=table,
+                        row_mapper=lambda row: row,
+                        conflict_key="slug",
+                        batch_size=1,
+                    ),
+                    config=DeliveryConfig(checkpoint=checkpoint_store),
+                )
+                .run()
+            ),
+            timeout=_INTEGRATION_TIMEOUT_S,
+        )
+
+        async with conn.cursor() as cur:
+            await cur.execute(f'SELECT slug, display_name FROM "{table}" ORDER BY slug')
+            rows = await cur.fetchall()
+    finally:
+        await checkpoint_store.close()
+        async with conn.cursor() as cur:
+            await cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        await conn.close()
+
+    assert replay_summary.records_written == 2
+    assert rows == [("a", "alpha"), ("b", "bravo")]
 
 
 @pytest.mark.asyncio
@@ -780,6 +877,7 @@ async def test_postgres_sink_routes_missing_required_column_failures_to_postgres
                         write_safety_policy=PostgresWriteSafetyPolicy.ALIGN_TO_TARGET,
                     ),
                     config=DeliveryConfig(
+                        batch_size=1,
                         dlq=PostgresDLQSink(dsn=postgres_dsn, table=dlq_table),
                         sink_failure_policy=SinkFailurePolicy.LOG_AND_CONTINUE,
                     ),
@@ -1119,6 +1217,7 @@ async def test_postgres_sink_routes_constraint_violation_matrix_to_postgres_dlq(
                         batch_size=1,
                     ),
                     config=DeliveryConfig(
+                        batch_size=1,
                         dlq=PostgresDLQSink(dsn=postgres_dsn, table=dlq_table),
                         sink_failure_policy=SinkFailurePolicy.LOG_AND_CONTINUE,
                     ),
@@ -1206,6 +1305,7 @@ async def test_postgres_sink_routes_foreign_key_violation_to_postgres_dlq(
                         batch_size=1,
                     ),
                     config=DeliveryConfig(
+                        batch_size=1,
                         dlq=PostgresDLQSink(dsn=postgres_dsn, table=dlq_table),
                         sink_failure_policy=SinkFailurePolicy.LOG_AND_CONTINUE,
                     ),
@@ -1286,6 +1386,7 @@ async def test_postgres_sink_routes_type_mismatch_to_postgres_dlq(
                         batch_size=1,
                     ),
                     config=DeliveryConfig(
+                        batch_size=1,
                         dlq=PostgresDLQSink(dsn=postgres_dsn, table=dlq_table),
                         sink_failure_policy=SinkFailurePolicy.LOG_AND_CONTINUE,
                     ),
@@ -1372,7 +1473,10 @@ async def test_postgres_source_resumes_from_checkpoint_cursor_against_real_datab
                         checkpoint_param="last_id",
                     )
                 )
-                .build(_CollectSink(first_records), checkpoint=store)  # type: ignore[arg-type]
+                .build(  # type: ignore[arg-type]
+                    _CollectSink(first_records),
+                    config=DeliveryConfig(checkpoint=store),
+                )
                 .run(max_records=2)
             ),
             timeout=_INTEGRATION_TIMEOUT_S,
@@ -1391,7 +1495,10 @@ async def test_postgres_source_resumes_from_checkpoint_cursor_against_real_datab
                         checkpoint_param="last_id",
                     )
                 )
-                .build(_CollectSink(second_records), checkpoint=store)  # type: ignore[arg-type]
+                .build(  # type: ignore[arg-type]
+                    _CollectSink(second_records),
+                    config=DeliveryConfig(checkpoint=store),
+                )
                 .run()
             ),
             timeout=_INTEGRATION_TIMEOUT_S,
@@ -2210,8 +2317,10 @@ async def test_postgres_source_can_log_and_continue_when_checkpoint_store_fails(
                 )
                 .build(  # type: ignore[arg-type]
                     _CollectSink(collected),
-                    checkpoint=_FailingCheckpointStore(),
-                    checkpoint_failure_policy=CheckpointFailurePolicy.LOG_AND_CONTINUE,
+                    config=DeliveryConfig(
+                        checkpoint=_FailingCheckpointStore(),
+                        checkpoint_failure_policy=CheckpointFailurePolicy.LOG_AND_CONTINUE,
+                    ),
                 )
                 .run()
             ),
@@ -2284,7 +2393,10 @@ async def test_postgres_source_resumes_from_composite_checkpoint_cursor_against_
                         checkpoint_params={"created_at": "last_created_at", "id": "last_id"},
                     )
                 )
-                .build(_CollectSink(first_records), checkpoint=store)  # type: ignore[arg-type]
+                .build(  # type: ignore[arg-type]
+                    _CollectSink(first_records),
+                    config=DeliveryConfig(checkpoint=store),
+                )
                 .run(max_records=2)
             ),
             timeout=_INTEGRATION_TIMEOUT_S,
@@ -2303,7 +2415,10 @@ async def test_postgres_source_resumes_from_composite_checkpoint_cursor_against_
                         checkpoint_params={"created_at": "last_created_at", "id": "last_id"},
                     )
                 )
-                .build(_CollectSink(second_records), checkpoint=store)  # type: ignore[arg-type]
+                .build(  # type: ignore[arg-type]
+                    _CollectSink(second_records),
+                    config=DeliveryConfig(checkpoint=store),
+                )
                 .run()
             ),
             timeout=_INTEGRATION_TIMEOUT_S,

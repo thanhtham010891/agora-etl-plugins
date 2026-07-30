@@ -7,9 +7,15 @@ import contextlib
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast
 
 import logstruct
+from agora.core.checkpoint import Checkpoint, SourceIdentity, SourceIdentityMismatchPolicy
 from agora.core.source import BaseSource, SourceRuntimeMetrics
 from agora.core.types import SourceRecordFailurePolicy
 
+from agora_plugins._source_identity import (
+    fingerprint_source_identity,
+    redact_url_password,
+    validate_resume_checkpoint_identity,
+)
 from agora_plugins.s3.config import S3ConnectionConfig, build_s3_client, coerce_connection_config
 from agora_plugins.s3.observability import (
     S3SourceMetricsSnapshot,
@@ -20,8 +26,6 @@ from agora_plugins.s3.sources.object_runtime import S3SourceObjectRuntime
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Sequence
-
-    from agora.core.checkpoint import Checkpoint
 
 T = TypeVar("T")
 logger = logstruct.getLogger(__name__)
@@ -57,6 +61,8 @@ class S3Source(BaseSource[T], Generic[T]):
         addressing_style: Literal["auto", "path", "virtual"] = "auto",
         connection: S3ConnectionConfig | None = None,
         client: Any | None = None,
+        source_identity_mismatch_policy: SourceIdentityMismatchPolicy
+        | str = SourceIdentityMismatchPolicy.FAIL_CLOSED,
     ) -> None:
         self._bucket = bucket
         self._prefix = prefix
@@ -77,6 +83,9 @@ class S3Source(BaseSource[T], Generic[T]):
             connection=connection,
         )
         self._client = client
+        self._source_identity_mismatch_policy = SourceIdentityMismatchPolicy(
+            source_identity_mismatch_policy
+        )
         self._resume_after_key: str | None = None
         self._listed_object_count = 0
         self._completed_object_count = 0
@@ -120,12 +129,40 @@ class S3Source(BaseSource[T], Generic[T]):
         self._last_listed_key = None
         self._last_completed_key = None
         self._last_error = None
+        checkpoint = validate_resume_checkpoint_identity(
+            checkpoint,
+            current_identity=self.checkpoint_source_identity(),
+            policy=self._source_identity_mismatch_policy,
+            source_name=self.source_name,
+        )
         if checkpoint is None:
             return
         value = checkpoint.value if isinstance(checkpoint.value, dict) else {}
         checkpoint_key = value.get("object_key")
         if checkpoint_key is not None:
             self._resume_after_key = str(checkpoint_key)
+
+    def checkpoint_source_identity(self) -> SourceIdentity:
+        """Return a secret-free identity for this ordered S3 dataset input."""
+        return fingerprint_source_identity(
+            "s3-dataset",
+            {
+                "bucket": self._bucket,
+                "prefix": self._prefix,
+                "format": self._format,
+                "delimiter": self._delimiter,
+                "has_header": self._has_header,
+                "fieldnames": self._fieldnames,
+                "encoding": self._encoding,
+                "region_name": self._connection.region_name,
+                "endpoint_url": (
+                    None
+                    if self._connection.endpoint_url is None
+                    else redact_url_password(self._connection.endpoint_url)
+                ),
+                "addressing_style": self._connection.addressing_style,
+            },
+        )
 
     def current_checkpoint(self) -> dict[str, Any] | None:
         if self._last_completed_key is None:

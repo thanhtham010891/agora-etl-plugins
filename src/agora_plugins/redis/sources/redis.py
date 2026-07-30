@@ -23,14 +23,22 @@ Usage::
 from __future__ import annotations
 
 import contextlib
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 import logstruct
+from agora.core.checkpoint import Checkpoint, SourceIdentity, SourceIdentityMismatchPolicy
 from agora.core.retry import RetryPolicy
 from agora.core.source import BaseSource, SourceRuntimeMetrics
 from agora.core.types import SourceRecordFailurePolicy
 
+from agora_plugins._source_identity import (
+    fingerprint_source_identity,
+    redact_url_password,
+    validate_resume_checkpoint_identity,
+)
+from agora_plugins.redis.failures import classify_redis_failure
 from agora_plugins.redis.observability import (
     RedisEnterpriseAcceptanceGate,
     RedisPrometheusExporter,
@@ -47,14 +55,36 @@ from agora_plugins.redis.sources._stream_runtime import RedisReadLoopRuntime
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 
-    from agora.core.checkpoint import Checkpoint
-
 T = TypeVar("T")
 logger = logstruct.getLogger(__name__)
 
 
 def _now_utc() -> datetime:
     return datetime.now(UTC)
+
+
+@dataclass(frozen=True, slots=True)
+class RedisStreamDeliveryContext:
+    """Stable Redis Streams coordinates for downstream idempotency recipes."""
+
+    stream: str
+    group: str
+    consumer: str
+    message_id: str
+
+    @property
+    def delivery_id(self) -> str:
+        """Return the stable target identity for one Redis Stream message."""
+        return f"{self.stream}:{self.message_id}"
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "stream": self.stream,
+            "group": self.group,
+            "consumer": self.consumer,
+            "message_id": self.message_id,
+            "delivery_id": self.delivery_id,
+        }
 
 
 class RedisStreamSource(BaseSource[T], Generic[T]):
@@ -83,6 +113,8 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
         sentinel_service_name: str | None = None,
         sentinel_urls: list[str] | None = None,
         reconnect_retry_policy: RetryPolicy[Any] | None = None,
+        source_identity_mismatch_policy: SourceIdentityMismatchPolicy
+        | str = SourceIdentityMismatchPolicy.FAIL_CLOSED,
     ) -> None:
         self._url = url
         self._stream = stream
@@ -115,6 +147,9 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
         self._redis_cluster = redis_cluster
         self._sentinel_service_name = sentinel_service_name
         self._sentinel_urls = list(sentinel_urls or [])
+        self._source_identity_mismatch_policy = SourceIdentityMismatchPolicy(
+            source_identity_mismatch_policy
+        )
         self._reconnect_retry_policy = reconnect_retry_policy or RetryPolicy[Any](
             max_attempts=20,
             initial_backoff_s=0.25,
@@ -122,6 +157,7 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
             max_backoff_s=2.0,
             jitter_ratio=0.2,
             retry_exceptions=(Exception,),
+            failure_classifier=classify_redis_failure,
         )
         self._client: Any | None = None
         self._last_message_id: str | None = None
@@ -132,6 +168,7 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
         self._record_error_count = 0
         self._record_drop_count = 0
         self._delivery_success_hook: Callable[[], Awaitable[None]] | None = None
+        self._delivery_context: RedisStreamDeliveryContext | None = None
         self._pending_ack_ids: list[str | bytes] = []
         self._checkpoint_cache: dict[str, str] | None = None
         self._group_ready = False
@@ -181,7 +218,28 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
         ``stream()`` fails before rewinding the group cursor.
         """
 
-        await self._resume_runtime.prepare_resume(checkpoint)
+        await self._resume_runtime.prepare_resume(
+            validate_resume_checkpoint_identity(
+                checkpoint,
+                current_identity=self.checkpoint_source_identity(),
+                policy=self._source_identity_mismatch_policy,
+                source_name=self.source_name,
+            )
+        )
+
+    def checkpoint_source_identity(self) -> SourceIdentity:
+        """Return the secret-free identity of this Redis Stream consumer group."""
+        return fingerprint_source_identity(
+            "redis-stream",
+            {
+                "group": self._group,
+                "redis_cluster": self._redis_cluster,
+                "sentinel_service_name": self._sentinel_service_name,
+                "sentinel_urls": sorted(redact_url_password(url) for url in self._sentinel_urls),
+                "stream": self._stream,
+                "url": redact_url_password(self._url),
+            },
+        )
 
     async def stream(self) -> AsyncGenerator[T, None]:
         async for record in self._stream_runtime.stream():
@@ -263,6 +321,22 @@ class RedisStreamSource(BaseSource[T], Generic[T]):
 
     def delivery_success_callback(self) -> Callable[[], Awaitable[None]] | None:
         return self._ack_runtime.delivery_success_callback()
+
+    async def flush_delivery_acks(self) -> None:
+        """Persist callbacks queued by a composed delivery profile as Redis `XACK`s."""
+        await self._flush_pending_acks()
+
+    def delivery_context(self) -> RedisStreamDeliveryContext | None:
+        """Return active Redis Streams coordinates while a record is being handled."""
+        return self._delivery_context
+
+    def _build_delivery_context(self, message_id: str) -> RedisStreamDeliveryContext:
+        return RedisStreamDeliveryContext(
+            stream=self._stream,
+            group=self._group,
+            consumer=self._consumer,
+            message_id=message_id,
+        )
 
     def current_checkpoint(self) -> dict[str, str] | None:
         return self._ack_runtime.current_checkpoint()

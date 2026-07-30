@@ -4,9 +4,13 @@ import sys
 from types import ModuleType
 
 import pytest
+from agora import DeliveryConfig, Pipeline
 from agora.core.acceptance import AcceptanceReport
+from agora.core.checkpoint import InMemoryCheckpointStore
 from agora.core.data_plane import DataPlane
+from agora.core.delivery import DeliveryPolicy, DeliveryPolicyMismatchError
 from agora.core.health import ComponentHealthSnapshot
+from agora.sources.file import CsvSource
 
 from agora_plugins.bigquery import BigQuerySink, BigQuerySinkEnterpriseAcceptanceThresholds
 from agora_plugins.bigquery.sinks.bigquery import BigQuerySinkWriteError
@@ -157,6 +161,32 @@ async def test_bigquery_sink_wraps_result_exceptions_with_job_metadata(
 def test_bigquery_sink_rejects_invalid_write_disposition() -> None:
     with pytest.raises(ValueError, match="write_disposition"):
         BigQuerySink(table="analytics.events", write_disposition="merge")
+
+
+@pytest.mark.asyncio
+async def test_file_to_bigquery_profile_blocks_replay_safe_policy_before_sink_open(
+    tmp_path,
+) -> None:
+    path = tmp_path / "records.csv"
+    path.write_text("id\n1\n", encoding="utf-8")
+    pipeline = Pipeline(CsvSource(path=path, row_mapper=lambda row: row)).build(
+        BigQuerySink(table="analytics.events"),
+        config=DeliveryConfig(
+            checkpoint=InMemoryCheckpointStore(),
+            delivery_policy=DeliveryPolicy(
+                require_replay_safe=True,
+                require_idempotent_sinks=True,
+            ),
+        ),
+    )
+
+    with pytest.raises(DeliveryPolicyMismatchError) as exc_info:
+        await pipeline.run()
+
+    assert [mismatch.code for mismatch in exc_info.value.mismatches] == [
+        "sink_not_replay_safe",
+        "sink_not_idempotent",
+    ]
 
 
 @pytest.mark.asyncio

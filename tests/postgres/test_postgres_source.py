@@ -11,6 +11,7 @@ from agora import (
     Pipeline,
     SourceRecordFailurePolicy,
 )
+from agora.core.checkpoint import SourceIdentityMismatchError
 from agora.core.source import SourceRecordError
 
 from agora_plugins.postgres import (
@@ -173,6 +174,7 @@ async def test_postgres_source_uses_checkpoint_cursor_for_resume(
             run_id="run-1",
             source="postgres",
             value={"cursor": 2},
+            source_identity=source.checkpoint_source_identity(),
         )
     )
 
@@ -184,6 +186,73 @@ async def test_postgres_source_uses_checkpoint_cursor_for_resume(
     ]
     assert cursor.executed_params == {"tenant": "demo", "last_id": 2}
     assert source.current_checkpoint() == {"row_number": 2, "cursor": 4}
+
+
+@pytest.mark.asyncio
+async def test_postgres_source_rejects_checkpoint_from_different_cursor_contract() -> None:
+    source = PostgresSource(
+        dsn="postgresql://example/test",
+        query="SELECT id FROM events WHERE id > %(last_id)s ORDER BY id",
+        row_mapper=lambda row: row,
+        checkpoint_field="id",
+        checkpoint_param="last_id",
+    )
+    other_source = PostgresSource(
+        dsn="postgresql://example/test",
+        query="SELECT id FROM orders WHERE id > %(last_id)s ORDER BY id",
+        row_mapper=lambda row: row,
+        checkpoint_field="id",
+        checkpoint_param="last_id",
+    )
+
+    with pytest.raises(SourceIdentityMismatchError, match="saved source identity differs"):
+        await source.prepare_resume(
+            Checkpoint(
+                pipeline_id="events",
+                run_id="run-1",
+                source="postgres",
+                value={"cursor": 2},
+                source_identity=other_source.checkpoint_source_identity(),
+            )
+        )
+
+    reset_source = PostgresSource(
+        dsn="postgresql://example/test",
+        query="SELECT id FROM events WHERE id > %(last_id)s ORDER BY id",
+        row_mapper=lambda row: row,
+        checkpoint_field="id",
+        checkpoint_param="last_id",
+        source_identity_mismatch_policy="reset",
+    )
+    await reset_source.prepare_resume(
+        Checkpoint(
+            pipeline_id="events",
+            run_id="run-1",
+            source="postgres",
+            value={"cursor": 2},
+            source_identity=other_source.checkpoint_source_identity(),
+        )
+    )
+    assert reset_source._params == {}  # type: ignore[attr-defined]
+
+    allowed_source = PostgresSource(
+        dsn="postgresql://example/test",
+        query="SELECT id FROM events WHERE id > %(last_id)s ORDER BY id",
+        row_mapper=lambda row: row,
+        checkpoint_field="id",
+        checkpoint_param="last_id",
+        source_identity_mismatch_policy="allow",
+    )
+    await allowed_source.prepare_resume(
+        Checkpoint(
+            pipeline_id="events",
+            run_id="run-1",
+            source="postgres",
+            value={"cursor": 2},
+            source_identity=other_source.checkpoint_source_identity(),
+        )
+    )
+    assert allowed_source._params == {"last_id": 2}  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
@@ -344,6 +413,7 @@ async def test_postgres_source_supports_composite_checkpoint_resume(
             run_id="run-1",
             source="postgres",
             value={"cursor": {"created_at": "2024-01-01T00:00:00", "id": 2}},
+            source_identity=source.checkpoint_source_identity(),
         )
     )
 

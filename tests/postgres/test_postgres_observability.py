@@ -190,6 +190,7 @@ async def test_postgres_source_metrics_snapshot_declares_checkpoint_rerun_contra
             run_id="run-1",
             source="postgres",
             value={"cursor": 1},
+            source_identity=source.checkpoint_source_identity(),
         )
     )
 

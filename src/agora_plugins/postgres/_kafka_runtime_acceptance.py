@@ -19,6 +19,9 @@ class KafkaPostgresEnterpriseAcceptanceThresholds:
     require_source_ready: bool = True
     require_source_not_stalled: bool = True
     require_sink_connection_ready: bool = True
+    require_delivery_key_conflict: bool = True
+    require_sink_upsert: bool = True
+    require_strict_sink_write_safety: bool = True
     require_poison_dlq_ready: bool = False
     max_pending_commit_count: int | None = 0
     max_idle_poll_count: int | None = 0
@@ -41,6 +44,9 @@ class KafkaPostgresEnterpriseAcceptanceThresholds:
             "require_source_ready": self.require_source_ready,
             "require_source_not_stalled": self.require_source_not_stalled,
             "require_sink_connection_ready": self.require_sink_connection_ready,
+            "require_delivery_key_conflict": self.require_delivery_key_conflict,
+            "require_sink_upsert": self.require_sink_upsert,
+            "require_strict_sink_write_safety": self.require_strict_sink_write_safety,
             "require_poison_dlq_ready": self.require_poison_dlq_ready,
             "max_pending_commit_count": self.max_pending_commit_count,
             "max_idle_poll_count": self.max_idle_poll_count,
@@ -135,6 +141,42 @@ class KafkaPostgresEnterpriseAcceptanceGate:
                     message="PostgreSQL sink connection is not ready.",
                     value=runtime_health.sink_connection_ready,
                     threshold=True,
+                )
+            )
+        if (
+            thresholds.require_delivery_key_conflict
+            and snapshot.delivery_key_field not in sink.conflict_keys
+        ):
+            findings.append(
+                KafkaPostgresEnterpriseAcceptanceFinding(
+                    metric="sink.delivery_key_conflict",
+                    message=(
+                        "PostgreSQL conflict keys must include the Kafka delivery key "
+                        "to make recovery replay idempotent."
+                    ),
+                    value=list(sink.conflict_keys),
+                    threshold=snapshot.delivery_key_field,
+                )
+            )
+        if thresholds.require_sink_upsert and not sink.upsert:
+            findings.append(
+                KafkaPostgresEnterpriseAcceptanceFinding(
+                    metric="sink.upsert",
+                    message="PostgreSQL upsert must be enabled for replay-safe delivery.",
+                    value=sink.upsert,
+                    threshold=True,
+                )
+            )
+        if thresholds.require_strict_sink_write_safety and sink.write_safety_policy != "strict":
+            findings.append(
+                KafkaPostgresEnterpriseAcceptanceFinding(
+                    metric="sink.write_safety_policy",
+                    message=(
+                        "Kafka -> PostgreSQL acceptance requires strict sink write safety "
+                        "to preserve the delivery-key replay boundary."
+                    ),
+                    value=sink.write_safety_policy,
+                    threshold="strict",
                 )
             )
         if (

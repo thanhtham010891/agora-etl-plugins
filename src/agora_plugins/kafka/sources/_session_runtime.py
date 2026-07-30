@@ -7,6 +7,7 @@ import importlib
 from typing import TYPE_CHECKING, Any, cast
 
 import logstruct
+from agora.core.retry import RetryPolicy, retry_async
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -46,6 +47,7 @@ class KafkaConsumerSession:
         set_topic_partition_cls: Callable[[Any | None], None],
         commit_if_needed: Callable[..., Awaitable[None]],
         on_consumer_closed: Callable[[], None],
+        retry_policy: RetryPolicy[Any],
     ) -> None:
         self._topics = list(topics)
         self._topic_pattern = topic_pattern
@@ -69,6 +71,7 @@ class KafkaConsumerSession:
         self._set_topic_partition_cls = set_topic_partition_cls
         self._commit_if_needed = commit_if_needed
         self._on_consumer_closed = on_consumer_closed
+        self._retry_policy = retry_policy
 
     async def open(self) -> None:
         try:
@@ -109,7 +112,7 @@ class KafkaConsumerSession:
             self._set_consumer(consumer)
             consumer = cast("Any", consumer)
             self._consumer_runtime.subscribe_consumer(self._rebalance_owner, consumer)
-            await consumer.start()
+            await retry_async(consumer.start, policy=self._retry_policy)
             self._consumer_runtime.bind_consumer(consumer)
             logger.info(
                 "kafka_source_ready",

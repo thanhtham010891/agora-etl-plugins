@@ -10,10 +10,17 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
+from agora.core.checkpoint import Checkpoint, SourceIdentity, SourceIdentityMismatchPolicy
+from agora.core.retry import RetryPolicy
 from agora.core.source import BaseSource
 from agora.core.types import SourceRecordFailurePolicy
 
+from agora_plugins._source_identity import (
+    fingerprint_source_identity,
+    validate_resume_checkpoint_identity,
+)
 from agora_plugins.kafka._security_posture import warn_if_insecure_plaintext
+from agora_plugins.kafka.failures import classify_kafka_failure
 from agora_plugins.kafka.sources._commit_runtime import KafkaCommitRuntime
 from agora_plugins.kafka.sources._consumer_runtime import KafkaConsumerRuntime
 from agora_plugins.kafka.sources._cursor_state import KafkaCursorState
@@ -99,6 +106,9 @@ class KafkaSource(KafkaSourceFacade, BaseSource[T], Generic[T]):
         poison_record_max_attempts: int | None = None,
         health_snapshot_cache_ms: int = 250,
         tracing: bool | KafkaOpenTelemetryTracing = False,
+        consumer_retry_policy: RetryPolicy[Any] | None = None,
+        source_identity_mismatch_policy: SourceIdentityMismatchPolicy
+        | str = SourceIdentityMismatchPolicy.FAIL_CLOSED,
     ) -> None:
         self._topics = list(topics or [])
         self._topic_pattern = topic_pattern
@@ -113,6 +123,9 @@ class KafkaSource(KafkaSourceFacade, BaseSource[T], Generic[T]):
             )
         self._bootstrap_servers = bootstrap_servers
         self._group_id = group_id
+        self._source_identity_mismatch_policy = SourceIdentityMismatchPolicy(
+            source_identity_mismatch_policy
+        )
         self._deserializer: Callable[..., T | Awaitable[T]] = deserializer or (lambda b: b)
         self._batch_deserializer = batch_deserializer
         self._auto_offset_reset = auto_offset_reset
@@ -151,6 +164,13 @@ class KafkaSource(KafkaSourceFacade, BaseSource[T], Generic[T]):
         self._security = resolve_security(security_protocol, security)
         self._security_protocol = (
             self._security.security_protocol if self._security is not None else security_protocol
+        )
+        self._consumer_retry_policy = consumer_retry_policy or RetryPolicy[Any](
+            max_attempts=3,
+            initial_backoff_s=0.25,
+            backoff_multiplier=2.0,
+            max_backoff_s=2.0,
+            failure_classifier=classify_kafka_failure,
         )
         warn_if_insecure_plaintext(
             subject=type(self).__name__,
@@ -287,6 +307,7 @@ class KafkaSource(KafkaSourceFacade, BaseSource[T], Generic[T]):
             set_topic_partition_cls=self._set_topic_partition_cls,
             commit_if_needed=self._commit_runtime.commit_if_needed,
             on_consumer_closed=self._handle_consumer_closed,
+            retry_policy=self._consumer_retry_policy,
         )
         self._source_surface = KafkaSourceSurface(
             cursor_state=self._cursor_state,
@@ -314,6 +335,7 @@ class KafkaSource(KafkaSourceFacade, BaseSource[T], Generic[T]):
             bootstrap_consumer_state=self._consumer_runtime.bootstrap_consumer_state,
             commit_if_needed=self._commit_runtime.commit_if_needed,
             on_state_changed=self._invalidate_health_snapshot_cache,
+            retry_policy=self._consumer_retry_policy,
         )
         self._health_monitor = KafkaHealthMonitor(
             cache_ms=self._health_snapshot_cache_ms,
@@ -344,6 +366,30 @@ class KafkaSource(KafkaSourceFacade, BaseSource[T], Generic[T]):
 
     async def close(self) -> None:
         await self._session_runtime.close()
+
+    def checkpoint_source_identity(self) -> SourceIdentity:
+        """Return the secret-free identity of this Kafka subscription."""
+        return fingerprint_source_identity(
+            "kafka",
+            {
+                "assignments": sorted(self._assignments),
+                "bootstrap_servers": self._bootstrap_servers,
+                "group_id": self._group_id,
+                "topic_pattern": self._topic_pattern,
+                "topics": sorted(self._topics),
+            },
+        )
+
+    async def prepare_resume(self, checkpoint: Checkpoint | None) -> None:
+        """Validate the saved subscription before seeking its offsets."""
+        await self._public_api.prepare_resume(
+            validate_resume_checkpoint_identity(
+                checkpoint,
+                current_identity=self.checkpoint_source_identity(),
+                policy=self._source_identity_mismatch_policy,
+                source_name=self.source_name,
+            )
+        )
 
     async def _commit_if_needed(self, *, force: bool = False) -> None:
         await self._commit_runtime.commit_if_needed(force=force)
